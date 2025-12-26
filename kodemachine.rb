@@ -249,7 +249,8 @@ module Kodemachine
       when "suspend" then vm_suspend(normalize_label(args.shift))
       when "delete"  then vm_delete(normalize_label(args.shift))
       else
-        spawn(normalize_label(command)) # Treat as label
+        puts "❌ Unknown command: #{command}"
+        puts "   Run 'kodemachine' for help."
       end
     end
 
@@ -268,16 +269,16 @@ module Kodemachine
       puts <<~HELP
         Kodemachine v#{VERSION} - Ephemeral VM Manager
 
-        Usage: kodemachine <label>           Spawn/SSH into VM
-               kodemachine <command> [args]  Run a command
+        Usage: kodemachine <command> [label] [options]
 
         Commands:
+          start <label>     Create/start VM and SSH into it
+          stop <label>      Shutdown VM
+          suspend <label>   Pause VM to memory (fast resume)
+          delete <label>    Remove VM entirely
           status            Show system overview
           status <label>    Show specific VM status
           list              List all ephemeral VMs
-          stop <label>      Shutdown VM
-          suspend <label>   Pause VM to memory
-          delete <label>    Remove VM entirely
           attach <label>    Serial console access
           doctor            Check system health
 
@@ -286,13 +287,10 @@ module Kodemachine
           --no-disk         Don't attach shared projects disk
           -h, --help        Show this help
 
-        Notes:
-          - Default is headless (no display) - can run multiple VMs
-          - Use --gui for browser testing (limited to one VM)
-
         Examples:
-          kodemachine myproject       # Create/connect to km-myproject
-          kodemachine stop myproject  # Shutdown km-myproject
+          kodemachine start myproject   # Create/connect to km-myproject
+          kodemachine suspend myproject # Pause (instant resume later)
+          kodemachine stop myproject    # Shutdown km-myproject
       HELP
     end
 
