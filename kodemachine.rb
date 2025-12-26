@@ -10,6 +10,7 @@ module Kodemachine
   CONFIG_DIR   = File.expand_path("~/.config/kodemachine")
   CONFIG_FILE  = File.join(CONFIG_DIR, "config.json")
   UTM_DOCS     = File.expand_path("~/Library/Containers/com.utmapp.UTM/Data/Documents")
+  QEMU_IMG     = "/opt/homebrew/bin/qemu-img"
 
   DEFAULT_CONFIG = {
     'base_image'  => 'kodeimage-v0.1.0',
@@ -156,9 +157,16 @@ module Kodemachine
     def ensure_running(label, gui: false, attach_disk: true)
       abort "❌ Label required. Run 'kodemachine' for help." unless label
 
+      # Strip prefix if accidentally included
+      prefix = @config['prefix']
+      label = label.sub(/^#{Regexp.escape(prefix)}/, '')
+
       # Prevent "start" or other commands being used as labels
       reserved = %w[list doctor delete attach status stop suspend]
       abort "❌ '#{label}' is a reserved command." if reserved.include?(label)
+
+      name = "#{prefix}#{label}"
+      vm = VM.new(name)
 
       # Check for existing GUI VM if requesting GUI mode
       if gui && gui_vm_running?
@@ -166,17 +174,18 @@ module Kodemachine
               "   Stop it first or use headless mode (without --gui)."
       end
 
-      # Auto-disable shared disk if another VM is using it
-      if attach_disk && shared_disk_in_use?
-        puts "⚠️  Shared disk in use by another VM - spawning without it"
-        attach_disk = false
-      end
-
-      name = "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-
       # 1. Clone if missing (using APFS CoW for instant, zero-space clones)
-      unless vm.exists?
+      if vm.exists?
+        # Existing VM - show disk status
+        has_disk = File.symlink?("#{UTM_DOCS}/#{name}.utm/Data/shared-projects.qcow2")
+        puts has_disk ? "📎 Has shared disk" : "💾 No shared disk attached"
+      else
+        # Only check shared disk conflict when creating a new VM
+        if attach_disk && shared_disk_in_use?
+          puts "⚠️  Shared disk in use by another VM - spawning without it"
+          attach_disk = false
+        end
+
         puts "🏗️  Cloning #{@config['base_image']} -> #{name}..."
         apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui)
       end
@@ -311,8 +320,153 @@ module Kodemachine
     end
 
     def display_list
-      puts "Ephemeral Instances:"
-      puts `utmctl list`.split("\n").select { |l| l.include?(@config['prefix']) }
+      prefix = @config['prefix']
+      lines = `utmctl list 2>/dev/null`.split("\n").select { |l| l.include?(prefix) }
+
+      if lines.empty?
+        puts "No ephemeral instances"
+        return
+      end
+
+      # Collect VM data
+      vms = lines.map do |line|
+        parts = line.split(/\s+/)
+        status = parts[1]
+        name = parts[2]
+        label = name.sub(prefix, '')
+        vm_path = "#{UTM_DOCS}/#{name}.utm"
+
+        # Created (time ago)
+        created = File.exist?(vm_path) ? time_ago(File.birthtime(vm_path)) : "?"
+
+        # Shared disk usage
+        disk_link = "#{vm_path}/Data/shared-projects.qcow2"
+        disk = if File.symlink?(disk_link)
+          shared_disk_usage
+        else
+          "NA"
+        end
+
+        # RAM - live usage for running VMs, allocated for stopped
+        ram = "?"
+        plist_path = "#{vm_path}/config.plist"
+        if File.exist?(plist_path)
+          content = File.read(plist_path)
+          mem_mb = content.match(/<key>MemorySize<\/key>\s*<integer>(\d+)<\/integer>/)&.[](1)
+          allocated_gb = mem_mb ? mem_mb.to_i / 1024 : nil
+
+          if status == 'started' && allocated_gb
+            # Try live RAM via guest agent
+            ram_out = `utmctl exec "#{name}" --cmd free -m 2>/dev/null`.strip
+            ram_match = ram_out.match(/Mem:\s+(\d+)\s+(\d+)/)
+            if ram_match
+              total_mb = ram_match[1].to_i
+              used_mb = ram_match[2].to_i
+              percent = [(used_mb.to_f / total_mb * 100).round, 1].max
+              ram = format("%02d%% of %dGB", percent, total_mb / 1024)
+            else
+              ram = "#{allocated_gb}GB"
+            end
+          elsif allocated_gb
+            ram = "#{allocated_gb}GB"
+          end
+        end
+
+        # Storage usage
+        storage = vm_storage_percent(vm_path)
+
+        { label: label, status: status, created: created, disk: disk, ram: ram, storage: storage }
+      end
+
+      # Status emoji (emoji + status text)
+      status_emoji = { 'started' => '🟢', 'stopped' => '⚫', 'suspended' => '🟡' }
+      vms.each { |v| v[:status_display] = "#{status_emoji[v[:status]] || '⚪'} #{v[:status]}" }
+
+      # Dynamic column widths based on content
+      cols = {
+        label:   { header: "Label",   values: vms.map { |v| v[:label] } },
+        status:  { header: "Status",  values: vms.map { |v| v[:status] } },  # Use raw status for width calc
+        created: { header: "Created", values: vms.map { |v| v[:created] } },
+        disk:    { header: "Disk",    values: vms.map { |v| v[:disk] } },
+        ram:     { header: "RAM",     values: vms.map { |v| v[:ram] } },
+        storage: { header: "Storage", values: vms.map { |v| v[:storage] } }
+      }
+
+      # Calculate widths (header or max content, whichever is larger)
+      widths = cols.transform_values do |col|
+        [col[:header].length, col[:values].map(&:length).max || 0].max
+      end
+      widths[:status] += 3  # Account for emoji (2 display chars) + space
+
+      # Header (centered)
+      headers = cols.keys.map { |k| cols[k][:header].center(widths[k]) }.join(" │ ")
+      puts headers
+      puts cols.keys.map { |k| "─" * widths[k] }.join("─┼─")
+
+      # Rows (emoji takes 2 display chars, so pad status accordingly)
+      vms.each do |v|
+        status_padded = v[:status_display] + " " * (widths[:status] - v[:status].length - 3)
+        row = [
+          v[:label].ljust(widths[:label]),
+          status_padded,
+          v[:created].ljust(widths[:created]),
+          v[:disk].ljust(widths[:disk]),
+          v[:ram].ljust(widths[:ram]),
+          v[:storage].ljust(widths[:storage])
+        ].join(" │ ")
+        puts row
+      end
+    end
+
+    def time_ago(time)
+      seconds = (Time.now - time).to_i
+      case seconds
+      when 0..59       then "#{seconds}s ago"
+      when 60..3599    then "#{seconds / 60}m ago"
+      when 3600..86399 then "#{seconds / 3600}h ago"
+      else                  "#{seconds / 86400}d ago"
+      end
+    end
+
+    def shared_disk_usage
+      shared_path = "#{UTM_DOCS}/#{@config['shared_disk']}"
+      return "?" unless File.exist?(shared_path)
+
+      # Actual size on disk
+      actual = `du -sk "#{shared_path}" 2>/dev/null`.split("\t").first.to_i * 1024
+
+      # Virtual size from qcow2
+      info = `"#{QEMU_IMG}" info -U "#{shared_path}" 2>/dev/null`
+      match = info.match(/virtual size:.*\((\d+) bytes\)/)
+      return "?" unless match
+
+      virtual = match[1].to_i
+      percent = [(actual.to_f / virtual * 100).round, 1].max
+      virtual_gb = (virtual.to_f / 1024**3).round
+      format("%02d%% of %dGB", percent, virtual_gb)
+    end
+
+    def vm_storage_percent(vm_path)
+      return "?" unless File.exist?(vm_path)
+
+      # Get actual size on disk
+      actual = `du -sk "#{vm_path}" 2>/dev/null`.split("\t").first.to_i * 1024
+
+      # Get virtual size from qcow2 (main disk, excluding symlinks)
+      qcow2_files = Dir.glob("#{vm_path}/Data/*.qcow2").reject { |f| File.symlink?(f) }
+      virtual = 0
+      qcow2_files.each do |f|
+        info = `"#{QEMU_IMG}" info -U "#{f}" 2>/dev/null`
+        if (match = info.match(/virtual size:.*\((\d+) bytes\)/))
+          virtual += match[1].to_i
+        end
+      end
+
+      return "?" if virtual == 0
+
+      percent = [(actual.to_f / virtual * 100).round, 1].max
+      virtual_gb = (virtual.to_f / 1024**3).round
+      format("%02d%% of %dGB", percent, virtual_gb)
     end
     
     def display_status(label)
@@ -320,12 +474,61 @@ module Kodemachine
       name = "#{@config['prefix']}#{label}"
       vm = VM.new(name)
       return puts "❌ VM '#{name}' not found" unless vm.exists?
+
+      resources = vm_resources(name)
+      status = vm.status
+
       puts "Name:    #{name}"
-      puts "Status:  #{vm.status}"
+      puts "Status:  #{status}"
       puts "IP:      #{vm.ip || 'Unknown'}"
-      puts "CPU:     #{vm_resources(name).split('/').first}"
-      puts "RAM:     #{vm_resources(name).split('/').last}"
+      puts "CPU:     #{resources.split('/').first}"
+      puts "RAM:     #{resources.split('/').last}"
       puts "Storage: #{vm_storage(name)}"
+
+      # Live stats if running (via QEMU guest agent)
+      if status.include?('started')
+        live = live_stats(name)
+        if live
+          puts "─" * 30
+          puts "Live Usage:"
+          puts "  RAM:   #{live[:ram]}"
+          puts "  CPU:   #{live[:cpu]}"
+          puts "  Load:  #{live[:load]}"
+        end
+      end
+    end
+
+    def live_stats(name)
+      # RAM: free -m
+      ram_out = `utmctl exec #{name} --cmd free -m 2>/dev/null`.strip
+      return nil if ram_out.empty?
+
+      ram_match = ram_out.match(/Mem:\s+(\d+)\s+(\d+)/)
+      return nil unless ram_match
+
+      total_mb = ram_match[1].to_i
+      used_mb = ram_match[2].to_i
+      ram_percent = [(used_mb.to_f / total_mb * 100).round, 1].max
+      ram_str = format("%02d%% of %dGB", ram_percent, total_mb / 1024)
+
+      # Load average and CPU count
+      load_out = `utmctl exec #{name} --cmd cat /proc/loadavg 2>/dev/null`.strip
+      cpu_count_out = `utmctl exec #{name} --cmd nproc 2>/dev/null`.strip
+
+      load_parts = load_out.split
+      load_str = load_parts[0..2]&.join(", ") || "?"
+
+      # Derive CPU % from 1-min load average relative to CPU count
+      cpu_str = "?"
+      if load_parts[0] && !cpu_count_out.empty?
+        load_1m = load_parts[0].to_f
+        cpu_count = cpu_count_out.to_i
+        cpu_percent = [(load_1m / cpu_count * 100).round, 1].max
+        cpu_percent = [cpu_percent, 99].min  # Cap at 99%
+        cpu_str = format("%02d%%", cpu_percent)
+      end
+
+      { ram: ram_str, cpu: cpu_str, load: load_str }
     end
 
     def display_system_status
