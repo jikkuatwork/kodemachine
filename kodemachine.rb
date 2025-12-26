@@ -6,7 +6,7 @@ require 'fileutils'
 require 'optparse'
 
 module Kodemachine
-  VERSION      = "1.8.0"
+  VERSION      = "2.0.0"
   CONFIG_DIR   = File.expand_path("~/.config/kodemachine")
   CONFIG_FILE  = File.join(CONFIG_DIR, "config.json")
   UTM_DOCS     = File.expand_path("~/Library/Containers/com.utmapp.UTM/Data/Documents")
@@ -244,7 +244,7 @@ module Kodemachine
       when "doctor"  then run_doctor
       when "status"  then display_status(normalize_label(args.shift))
       when "attach"  then system("utmctl attach #{@config['prefix']}#{normalize_label(args.shift)}")
-      when "start"   then spawn(normalize_label(args.shift))
+      when "start", "resume" then spawn(normalize_label(args.shift))
       when "stop"    then vm_stop(normalize_label(args.shift))
       when "suspend" then vm_suspend(normalize_label(args.shift))
       when "delete"  then vm_delete(normalize_label(args.shift))
@@ -272,7 +272,7 @@ module Kodemachine
         Usage: kodemachine <command> [label] [options]
 
         Commands:
-          start <label>     Create/start VM and SSH into it
+          start <label>     Create/start VM and SSH into it (alias: resume)
           stop <label>      Shutdown VM
           suspend <label>   Pause VM to memory (fast resume)
           delete <label>    Remove VM entirely
