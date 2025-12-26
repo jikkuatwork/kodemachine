@@ -190,17 +190,26 @@ module Kodemachine
         apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui)
       end
 
-      # 2. Start if stopped
-      if vm.status.include?('stopped')
+      # 2. Start if stopped, or resume if paused/suspended
+      status = vm.status
+      if status.include?('stopped')
         puts "🚀 Starting #{name}..."
         mode = (!gui) ? "--hide" : ""
-        # Capture and ignore the -10004/-1712 noise
         `utmctl start #{name} #{mode} 2>/dev/null`
 
-        # Guard: Verification loop to ensure it's actually moving
+        # Wait for VM to start
         5.times do
           break if vm.status.include?('started')
           sleep 1
+        end
+      elsif status.include?('paused') || status.include?('suspended')
+        puts "▶️  Resuming #{name}..."
+        `utmctl start #{name} 2>/dev/null`
+
+        # Wait for VM to resume (should be instant)
+        3.times do
+          break if vm.status.include?('started')
+          sleep 0.5
         end
       end
       vm
@@ -296,17 +305,21 @@ module Kodemachine
 
     def spawn(label)
       vm = @manager.ensure_running(label, gui: @options[:gui], attach_disk: !@options[:no_disk])
-      
-      puts "🔍 Negotiating IP (this can take 20-40s)..."
-      ip = nil
-      30.times do
-        ip = vm.ip
-        break if ip
-        print "."
-        $stdout.flush
-        sleep 2
+
+      # Try instant IP first (works for resumed/already running VMs)
+      ip = vm.ip
+
+      unless ip
+        puts "🔍 Waiting for IP..."
+        30.times do
+          ip = vm.ip
+          break if ip
+          print "."
+          $stdout.flush
+          sleep 2
+        end
+        puts ""
       end
-      puts ""
 
       if ip
         puts "✅ Ready: #{ip}"
@@ -382,7 +395,7 @@ module Kodemachine
       end
 
       # Status emoji (emoji + status text)
-      status_emoji = { 'started' => '🟢', 'stopped' => '⚫', 'suspended' => '🟡' }
+      status_emoji = { 'started' => '🟢', 'stopped' => '⚫', 'suspended' => '🟡', 'paused' => '🟡' }
       vms.each { |v| v[:status_display] = "#{status_emoji[v[:status]] || '⚪'} #{v[:status]}" }
 
       # Dynamic column widths based on content
