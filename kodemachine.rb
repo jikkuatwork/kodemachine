@@ -165,29 +165,46 @@ module Kodemachine
       reserved = %w[list doctor delete attach status stop suspend]
       abort "❌ '#{label}' is a reserved command." if reserved.include?(label)
 
-      name = "#{prefix}#{label}"
+      # Special case: "base" starts the base image directly (for modifications)
+      is_base = label == 'base'
+      name = is_base ? @config['base_image'] : "#{prefix}#{label}"
       vm = VM.new(name)
 
-      # Check for existing GUI VM if requesting GUI mode
-      if gui && gui_vm_running?
-        abort "❌ Cannot start GUI VM: another GUI VM is already running.\n" \
-              "   Stop it first or use headless mode (without --gui)."
-      end
+      if is_base
+        puts "📦 Starting base image directly (changes will affect future clones)"
+        abort "❌ Base image not found: #{name}" unless vm.exists?
 
-      # 1. Clone if missing (using APFS CoW for instant, zero-space clones)
-      if vm.exists?
-        # Existing VM - show disk status
-        has_disk = File.symlink?("#{UTM_DOCS}/#{name}.utm/Data/shared-projects.qcow2")
-        puts has_disk ? "📎 Has shared disk" : "💾 No shared disk attached"
+        # Warn if clones are running (may cause MAC/IP conflicts with older clones)
+        running_clones = `utmctl list 2>/dev/null`.split("\n")
+          .select { |l| l.include?(prefix) && l.include?('started') }
+          .map { |l| l.split(/\s+/)[2] }
+        unless running_clones.empty?
+          puts "⚠️  Warning: Running clones may conflict with base image network"
+          puts "   Running: #{running_clones.join(', ')}"
+          puts "   Consider stopping them first: kodemachine stop <label>"
+        end
       else
-        # Only check shared disk conflict when creating a new VM
-        if attach_disk && shared_disk_in_use?
-          puts "⚠️  Shared disk in use by another VM - spawning without it"
-          attach_disk = false
+        # Check for existing GUI VM if requesting GUI mode
+        if gui && gui_vm_running?
+          abort "❌ Cannot start GUI VM: another GUI VM is already running.\n" \
+                "   Stop it first or use headless mode (without --gui)."
         end
 
-        puts "🏗️  Cloning #{@config['base_image']} -> #{name}..."
-        apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui)
+        # 1. Clone if missing (using APFS CoW for instant, zero-space clones)
+        if vm.exists?
+          # Existing VM - show disk status
+          has_disk = File.symlink?("#{UTM_DOCS}/#{name}.utm/Data/shared-projects.qcow2")
+          puts has_disk ? "📎 Has shared disk" : "💾 No shared disk attached"
+        else
+          # Only check shared disk conflict when creating a new VM
+          if attach_disk && shared_disk_in_use?
+            puts "⚠️  Shared disk in use by another VM - spawning without it"
+            attach_disk = false
+          end
+
+          puts "🏗️  Cloning #{@config['base_image']} -> #{name}..."
+          apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui)
+        end
       end
 
       # 2. Start if stopped, or resume if paused/suspended
@@ -243,7 +260,7 @@ module Kodemachine
       when "list"    then display_list
       when "doctor"  then run_doctor
       when "status"  then display_status(normalize_label(args.shift))
-      when "attach"  then system("utmctl attach #{@config['prefix']}#{normalize_label(args.shift)}")
+      when "attach"  then vm_attach(normalize_label(args.shift))
       when "start", "resume" then spawn(normalize_label(args.shift))
       when "stop"    then vm_stop(normalize_label(args.shift))
       when "suspend" then vm_suspend(normalize_label(args.shift))
@@ -273,12 +290,13 @@ module Kodemachine
 
         Commands:
           start <label>     Create/start VM and SSH into it (alias: resume)
+          start base        Start the base image directly (for modifications)
           stop <label>      Shutdown VM
           suspend <label>   Pause VM to memory (fast resume)
           delete <label>    Remove VM entirely
           status            Show system overview
           status <label>    Show specific VM status
-          list              List all ephemeral VMs
+          list              List all VMs (including base image)
           attach <label>    Serial console access
           doctor            Check system health
 
@@ -289,6 +307,7 @@ module Kodemachine
 
         Examples:
           kodemachine start myproject   # Create/connect to km-myproject
+          kodemachine start base        # Modify the base image
           kodemachine suspend myproject # Pause (instant resume later)
           kodemachine stop myproject    # Shutdown km-myproject
       HELP
@@ -333,9 +352,10 @@ module Kodemachine
     def display_list
       prefix = @config['prefix']
       lines = `utmctl list 2>/dev/null`.split("\n").select { |l| l.include?(prefix) }
+      base_line = `utmctl list 2>/dev/null`.split("\n").find { |l| l.include?(@config['base_image']) }
 
-      if lines.empty?
-        puts "No ephemeral instances"
+      if lines.empty? && !base_line
+        puts "No VMs found"
         return
       end
 
@@ -390,6 +410,34 @@ module Kodemachine
         ip = status == 'started' ? (VM.new(name).ip || "-") : "-"
 
         { label: label, status: status, ip: ip, created: created, disk: disk, ram: ram, storage: storage }
+      end
+
+      # Add base image as special entry
+      if base_line
+        parts = base_line.split(/\s+/)
+        status = parts[1]
+        name = @config['base_image']
+        vm_path = "#{UTM_DOCS}/#{name}.utm"
+
+        ram = "?"
+        plist_path = "#{vm_path}/config.plist"
+        if File.exist?(plist_path)
+          content = File.read(plist_path)
+          mem_mb = content.match(/<key>MemorySize<\/key>\s*<integer>(\d+)<\/integer>/)&.[](1)
+          ram = mem_mb ? "#{mem_mb.to_i / 1024}GB" : "?"
+        end
+
+        ip = status == 'started' ? (VM.new(name).ip || "-") : "-"
+
+        vms.unshift({
+          label: "base",
+          status: status,
+          ip: ip,
+          created: "-",
+          disk: "NA",
+          ram: ram,
+          storage: vm_storage_percent(vm_path)
+        })
       end
 
       # Status emoji (emoji + status text)
@@ -490,7 +538,7 @@ module Kodemachine
     
     def display_status(label)
       return display_system_status unless label
-      name = "#{@config['prefix']}#{label}"
+      name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
       vm = VM.new(name)
       return puts "❌ VM '#{name}' not found" unless vm.exists?
 
@@ -593,7 +641,7 @@ module Kodemachine
 
     def vm_stop(label)
       return puts "Provide a label" unless label
-      name = "#{@config['prefix']}#{label}"
+      name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
       vm = VM.new(name)
       return puts "❌ VM '#{name}' not found" unless vm.exists?
       puts "🛑 Stopping #{name}..."
@@ -603,7 +651,7 @@ module Kodemachine
 
     def vm_suspend(label)
       return puts "Provide a label" unless label
-      name = "#{@config['prefix']}#{label}"
+      name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
       vm = VM.new(name)
       return puts "❌ VM '#{name}' not found" unless vm.exists?
       puts "⏸️  Suspending #{name}..."
@@ -613,12 +661,21 @@ module Kodemachine
 
     def vm_delete(label)
       return puts "Provide a label" unless label
+      if label == 'base'
+        abort "❌ Cannot delete base image. Use UTM directly if you really want to remove it."
+      end
       name = "#{@config['prefix']}#{label}"
       vm = VM.new(name)
       return puts "❌ VM '#{name}' not found" unless vm.exists?
       puts "🗑️  Deleting #{name}..."
       system("utmctl delete #{name}")
       puts "✅ Deleted"
+    end
+
+    def vm_attach(label)
+      return puts "Provide a label" unless label
+      name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
+      system("utmctl attach #{name}")
     end
   end
 end
