@@ -375,7 +375,10 @@ module Kodemachine
         # Storage usage
         storage = vm_storage_percent(vm_path)
 
-        { label: label, status: status, created: created, disk: disk, ram: ram, storage: storage }
+        # IP address (only for running VMs)
+        ip = status == 'started' ? (VM.new(name).ip || "-") : "-"
+
+        { label: label, status: status, ip: ip, created: created, disk: disk, ram: ram, storage: storage }
       end
 
       # Status emoji (emoji + status text)
@@ -386,6 +389,7 @@ module Kodemachine
       cols = {
         label:   { header: "Label",   values: vms.map { |v| v[:label] } },
         status:  { header: "Status",  values: vms.map { |v| v[:status] } },  # Use raw status for width calc
+        ip:      { header: "IP",      values: vms.map { |v| v[:ip] } },
         created: { header: "Created", values: vms.map { |v| v[:created] } },
         disk:    { header: "Disk",    values: vms.map { |v| v[:disk] } },
         ram:     { header: "RAM",     values: vms.map { |v| v[:ram] } },
@@ -399,9 +403,11 @@ module Kodemachine
       widths[:status] += 3  # Account for emoji (2 display chars) + space
 
       # Header (centered)
+      indent = "  "
+      puts
       headers = cols.keys.map { |k| cols[k][:header].center(widths[k]) }.join(" │ ")
-      puts headers
-      puts cols.keys.map { |k| "─" * widths[k] }.join("─┼─")
+      puts indent + headers
+      puts indent + cols.keys.map { |k| "─" * widths[k] }.join("─┼─")
 
       # Rows (emoji takes 2 display chars, so pad status accordingly)
       vms.each do |v|
@@ -409,13 +415,15 @@ module Kodemachine
         row = [
           v[:label].ljust(widths[:label]),
           status_padded,
+          v[:ip].ljust(widths[:ip]),
           v[:created].ljust(widths[:created]),
           v[:disk].ljust(widths[:disk]),
           v[:ram].ljust(widths[:ram]),
           v[:storage].ljust(widths[:storage])
         ].join(" │ ")
-        puts row
+        puts indent + row
       end
+      puts
     end
 
     def time_ago(time)
@@ -532,39 +540,10 @@ module Kodemachine
     end
 
     def display_system_status
-      prefix = @config['prefix']
-      lines = `utmctl list 2>/dev/null`.split("\n")
-      vms = lines.select { |l| l.include?(prefix) }
-
-      running = vms.count { |l| l.include?('started') }
-      stopped = vms.count { |l| l.include?('stopped') }
-      suspended = vms.count { |l| l.include?('suspended') }
-
-      # Calculate total storage
-      total_storage = vm_storage_total(prefix)
-
-      puts "Kodemachine v#{VERSION}"
-      puts "─" * 30
-      puts "Base image: #{@config['base_image']}"
-      puts "Prefix:     #{prefix}"
-      puts "─" * 30
-      puts "VMs:        #{vms.size} total"
-      puts "  Running:  #{running}"
-      puts "  Stopped:  #{stopped}"
-      puts "  Suspended: #{suspended}"
-      puts "Storage:    #{total_storage}"
-
-      if running > 0
-        puts "─" * 30
-        puts "Active VMs:"
-        vms.each do |line|
-          next unless line.include?('started')
-          name = line.split(/\s+/)[2]
-          vm = VM.new(name)
-          resources = vm_resources(name)
-          puts "  #{name.sub(prefix, '')} → #{vm.ip || 'no IP'} (#{resources})"
-        end
-      end
+      puts
+      puts "  Kodemachine v#{VERSION}"
+      puts "  Base: #{@config['base_image']} │ Shared: #{shared_disk_usage}"
+      display_list
     end
 
     def vm_storage_total(prefix)
