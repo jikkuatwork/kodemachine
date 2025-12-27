@@ -22,6 +22,33 @@ Kodemachine gives you **disposable Linux VMs that boot in seconds**:
 - **SSH-native** - `start` drops you into a shell
 - **Persistent storage** - Optional encrypted LUKS disk
 
+## Why Now: Isolating AI Agents
+
+AI coding assistants (Claude Code, Aider, Copilot) are powerful but risky. They
+execute code, install packages, and access your filesystem. In December 2025,
+Anthropic documented the [first large-scale AI-orchestrated cyberattack][1] -
+threat actors used Claude Code to compromise thirty organizations with minimal
+human involvement.
+
+The attack exploited three AI capabilities: **intelligence** (complex
+instructions), **agency** (autonomous operation), and **tools** (filesystem and
+network access). Attackers accomplished 80-90% of the campaign through AI
+automation.
+
+Meanwhile, researchers like [Dr. Anish Mohammed warn][2] about broader risks:
+LLMs with access to lab equipment, sequencers, or critical infrastructure. The
+same autonomy that makes AI assistants useful makes them dangerous when
+compromised or misused.
+
+**Kodemachine provides the first layer of defense:** disposable VMs where AI
+tools run isolated from your host. Combined with container sandboxing (see
+[testman][3]), you get defense in depth - AI agents can only access the project
+directory, not your SSH keys, credentials, or other projects.
+
+[1]: https://www.anthropic.com/news/disrupting-AI-espionage
+[2]: https://www.youtube.com/watch?v=3bMsWeWR7hI
+[3]: https://github.com/jikkuatwork/testman
+
 ## Quick Start
 
 ```bash
@@ -216,6 +243,8 @@ Any dotfiles repository works with kodemachine:
 ```
 
 The repo is cloned to `~/dotfiles`. If a `bootstrap.sh` script exists, it runs automatically. Otherwise, the repo is simply cloned for manual setup.
+
+Example: [jikkujose/dotfiles](https://github.com/jikkujose/dotfiles) - cross-platform config for zsh, fish, neovim, and tmux.
 
 ## Shell Completion
 
