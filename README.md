@@ -29,7 +29,7 @@ Kodemachine gives you **disposable Linux VMs that boot in seconds**:
 ./setup-host.rb
 
 # 2. Create base image (every ~6 months)
-./create-base.rb --dotfiles git@github.com:you/dotfiles.git --ssh-key ~/.ssh/id_ed25519.pub
+./create-base.rb --ssh-key ~/.ssh/id_ed25519.pub
 
 # 3. Daily workflow
 kodemachine start myproject
@@ -46,7 +46,6 @@ kodemachine start myproject
 │         ▼                                                   │
 │   create-base.rb     Every ~6 months: Build golden image   │
 │         │            - Ubuntu + GUI + browsers              │
-│         │            - Your dotfiles (via bootstrap.sh)     │
 │         │            - SSH key baked in                     │
 │         ▼                                                   │
 │   kodemachine.rb     Daily: Clone, start, stop, delete     │
@@ -54,7 +53,7 @@ kodemachine start myproject
 │         ▼                                                   │
 │   ┌─────────────────────────────────────────────────────┐  │
 │   │ km-myproject (APFS clone)                           │  │
-│   │   └── Your code, testman containers, etc.           │  │
+│   │   └── Your code, containers, etc.                   │  │
 │   └─────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -90,10 +89,8 @@ Run every ~6 months (or when you want a fresh golden image):
 # Minimal: just provision an existing Ubuntu VM
 ./create-base.rb
 
-# Full: with dotfiles and SSH key
-./create-base.rb \
-  --dotfiles git@github.com:you/dotfiles.git \
-  --ssh-key ~/.ssh/id_ed25519.pub
+# With SSH key
+./create-base.rb --ssh-key ~/.ssh/id_ed25519.pub
 
 # Skip GUI for headless-only use
 ./create-base.rb --skip-gui --skip-browsers
@@ -122,8 +119,6 @@ Run every ~6 months (or when you want a fresh golden image):
 | Fonts | Noto, Liberation, CaskaydiaCove Nerd Font |
 | Tools | htop, btop, tree, jq, xclip |
 | Shell | zsh (set as default) |
-
-Plus your dotfiles (if `--dotfiles` specified).
 
 ## Daily Commands
 
@@ -211,24 +206,6 @@ sudo mkfs.ext4 /dev/mapper/projects
 sudo mkdir -p /mnt/projects
 sudo mount /dev/mapper/projects /mnt/projects
 ```
-
-## Integration with Dotfiles
-
-Kodemachine works with your dotfiles repo:
-
-1. **create-base.rb** clones your dotfiles and runs `bootstrap.sh`
-2. All clones inherit the configured environment
-3. Update dotfiles in base image: `kodemachine start base`
-
-Recommended dotfiles structure:
-```
-dotfiles/
-├── bootstrap.sh    # CLI tools, shell config, editor
-└── ...
-```
-
-Keep GUI-specific setup in create-base.rb, not bootstrap.sh.
-This keeps bootstrap.sh portable across Mac, Linux, servers.
 
 ## Shell Completion
 
