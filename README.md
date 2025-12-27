@@ -25,7 +25,7 @@ Kodemachine gives you **disposable Linux VMs that boot in seconds**:
 ## Why Now: Isolating AI Agents
 
 AI coding assistants (Claude Code, Aider, Copilot) are powerful but risky. They
-execute code, install packages, and access your filesystem. In December 2025,
+execute code, install packages, and access your filesystem. In November 2025,
 Anthropic documented the [first large-scale AI-orchestrated cyberattack][1] -
 threat actors used Claude Code to compromise thirty organizations with minimal
 human involvement.
