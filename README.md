@@ -207,6 +207,16 @@ sudo mkdir -p /mnt/projects
 sudo mount /dev/mapper/projects /mnt/projects
 ```
 
+## Dotfiles Integration
+
+Any dotfiles repository works with kodemachine:
+
+```bash
+./create-base.rb --dotfiles git@github.com:you/dotfiles.git
+```
+
+The repo is cloned to `~/dotfiles`. If a `bootstrap.sh` script exists, it runs automatically. Otherwise, the repo is simply cloned for manual setup.
+
 ## Shell Completion
 
 ### Bash / Zsh

@@ -367,9 +367,9 @@ module KodemachineBase
       substep "Cloning #{repo}..."
       ssh_exec("git clone #{repo} ~/dotfiles")
 
-      # Run bootstrap
-      substep "Running bootstrap.sh..."
-      ssh_exec("cd ~/dotfiles && chmod +x bootstrap.sh && ./bootstrap.sh start")
+      # Run bootstrap.sh if it exists
+      substep "Looking for bootstrap.sh..."
+      ssh_exec("cd ~/dotfiles && test -f bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh start || echo 'No bootstrap.sh found, skipping'")
 
       success "Dotfiles installed"
     end
