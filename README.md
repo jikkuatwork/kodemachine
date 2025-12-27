@@ -22,51 +22,114 @@ Kodemachine gives you **disposable Linux VMs that boot in seconds**:
 - **SSH-native** - `start` drops you into a shell
 - **Persistent storage** - Optional encrypted LUKS disk
 
-## Requirements
-
-- macOS (Apple Silicon or Intel)
-- [UTM](https://mac.getutm.app/)
-- Ruby (included with macOS)
-
-## Install
+## Quick Start
 
 ```bash
-git clone https://github.com/yourusername/kodemachine.git
-cd kodemachine
-ln -s $PWD/kodemachine.rb /usr/local/bin/kodemachine
-chmod +x kodemachine.rb
+# 1. Setup host (once per Mac)
+./setup-host.rb
+
+# 2. Create base image (every ~6 months)
+./create-base.rb --dotfiles git@github.com:you/dotfiles.git --ssh-key ~/.ssh/id_ed25519.pub
+
+# 3. Daily workflow
+kodemachine start myproject
 ```
 
-## Base Image Setup
+## Architecture
 
-Kodemachine clones from a "golden image". Create one:
+```
+┌─────────────────────────────────────────────────────────────┐
+│ macOS Host                                                  │
+│                                                             │
+│   setup-host.rb      One-time: Install UTM, dependencies   │
+│         │                                                   │
+│         ▼                                                   │
+│   create-base.rb     Every ~6 months: Build golden image   │
+│         │            - Ubuntu + GUI + browsers              │
+│         │            - Your dotfiles (via bootstrap.sh)     │
+│         │            - SSH key baked in                     │
+│         ▼                                                   │
+│   kodemachine.rb     Daily: Clone, start, stop, delete     │
+│         │                                                   │
+│         ▼                                                   │
+│   ┌─────────────────────────────────────────────────────┐  │
+│   │ km-myproject (APFS clone)                           │  │
+│   │   └── Your code, testman containers, etc.           │  │
+│   └─────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
 
-1. Download [Ubuntu 24.04 ARM64](https://ubuntu.com/download/server/arm)
-2. Create VM in UTM named `kodeimage-v0.1.0`
-3. Install Ubuntu
-4. Inside the VM:
+## Files
+
+| File | Purpose | When to Run |
+|------|---------|-------------|
+| `setup-host.rb` | Install UTM, qemu-img, create symlinks | Once per Mac |
+| `create-base.rb` | Build golden VM image | Every ~6 months |
+| `kodemachine.rb` | VM lifecycle (start/stop/clone) | Daily |
+
+## Setup Host
+
+Run once on a new Mac:
 
 ```bash
-# Guest agent (required for IP discovery)
-sudo apt update && sudo apt install -y qemu-guest-agent
-sudo systemctl enable qemu-guest-agent
-
-# Unique IDs for clones (required)
-sudo truncate -s 0 /etc/machine-id
-
-# SSH key
-mkdir -p ~/.ssh
-echo "your-public-key" >> ~/.ssh/authorized_keys
+./setup-host.rb
 ```
 
-5. Shut down. Done.
+This will:
+- Check/install Homebrew
+- Install UTM (VM hypervisor)
+- Install qemu-img (disk tools)
+- Create config directory
+- Setup `kodemachine` command symlink
 
-## Commands
+## Create Base Image
+
+Run every ~6 months (or when you want a fresh golden image):
+
+```bash
+# Minimal: just provision an existing Ubuntu VM
+./create-base.rb
+
+# Full: with dotfiles and SSH key
+./create-base.rb \
+  --dotfiles git@github.com:you/dotfiles.git \
+  --ssh-key ~/.ssh/id_ed25519.pub
+
+# Skip GUI for headless-only use
+./create-base.rb --skip-gui --skip-browsers
+```
+
+### Options
+
+```
+-n, --name NAME        Base image name (default: kodeimage-vYYYY.MM)
+-u, --user USER        SSH username (default: kodeman)
+-k, --ssh-key PATH     SSH public key to inject
+-d, --dotfiles REPO    Git repo URL for dotfiles
+    --ip ADDRESS       Manual IP if auto-detection fails
+    --skip-gui         Skip XFCE installation
+    --skip-browsers    Skip Firefox/Chromium
+-v, --verbose          Show SSH commands
+```
+
+### What It Installs
+
+| Category | Packages |
+|----------|----------|
+| Core | qemu-guest-agent, openssh, curl, wget, git, build-essential |
+| GUI | XFCE4, xfce4-goodies, xfce4-terminal |
+| Browsers | Firefox, Chromium |
+| Fonts | Noto, Liberation, CaskaydiaCove Nerd Font |
+| Tools | htop, btop, tree, jq, xclip |
+| Shell | zsh (set as default) |
+
+Plus your dotfiles (if `--dotfiles` specified).
+
+## Daily Commands
 
 ```
 start <label>      Create/start VM and SSH in
 start base         Start base image directly (for modifications)
-resume <label>     Alias for start
 stop <label>       Graceful shutdown
 suspend <label>    Pause to memory (instant resume)
 delete <label>     Remove VM
@@ -84,13 +147,14 @@ doctor             Check system health
 --no-disk          Skip shared disk attachment
 ```
 
-## Usage
+## Usage Examples
 
 ```bash
 # Daily workflow
 kodemachine start work
 # ... code ...
-kodemachine suspend work
+kodemachine suspend work   # Instant pause
+kodemachine start work     # Instant resume
 
 # Multiple projects (concurrent)
 kodemachine start api
@@ -115,7 +179,7 @@ Location: `~/.config/kodemachine/config.json`
 
 ```json
 {
-  "base_image": "kodeimage-v0.1.0",
+  "base_image": "kodeimage-v2025.01",
   "ssh_user": "kodeman",
   "prefix": "km-",
   "headless": true,
@@ -147,6 +211,24 @@ sudo mkfs.ext4 /dev/mapper/projects
 sudo mkdir -p /mnt/projects
 sudo mount /dev/mapper/projects /mnt/projects
 ```
+
+## Integration with Dotfiles
+
+Kodemachine works with your dotfiles repo:
+
+1. **create-base.rb** clones your dotfiles and runs `bootstrap.sh`
+2. All clones inherit the configured environment
+3. Update dotfiles in base image: `kodemachine start base`
+
+Recommended dotfiles structure:
+```
+dotfiles/
+├── bootstrap.sh    # CLI tools, shell config, editor
+└── ...
+```
+
+Keep GUI-specific setup in create-base.rb, not bootstrap.sh.
+This keeps bootstrap.sh portable across Mac, Linux, servers.
 
 ## Shell Completion
 
@@ -187,40 +269,6 @@ complete -c kodemachine -n "__fish_seen_subcommand_from start stop suspend delet
   -a "base (utmctl list 2>/dev/null | grep 'km-' | awk '{print \$3}' | sed 's/^km-//')"
 ```
 
-## Architecture
-
-```
-┌─────────────────────────────────────┐
-│            CLI Layer                │
-│  - Argument parsing                 │
-│  - User feedback                    │
-│  - SSH handoff                      │
-└──────────────┬──────────────────────┘
-               │
-┌──────────────▼──────────────────────┐
-│          Manager Layer              │
-│  - APFS CoW cloning                 │
-│  - MAC address generation           │
-│  - Shared disk injection            │
-└──────────────┬──────────────────────┘
-               │
-┌──────────────▼──────────────────────┐
-│            VM Layer                 │
-│  - State via utmctl                 │
-│  - IP via guest agent               │
-│  - Resource stats                   │
-└─────────────────────────────────────┘
-```
-
-Key decisions:
-
-- **Pure Ruby** - No gems, uses macOS system Ruby
-- **Guest Agent** - Dynamic IP discovery
-- **APFS CoW** - Instant clones, zero initial disk
-- **Random MACs** - Unique DHCP leases per clone
-
-See [CORE.md](CORE.md) for details.
-
 ## Troubleshooting
 
 **SSH fails after start**
@@ -229,9 +277,9 @@ kodemachine attach <label>
 # Check: systemctl status qemu-guest-agent
 ```
 
-**IP conflicts with base image**
-- Stop all clones before starting base
-- Older clones may share MAC addresses
+**IP not detected**
+- Use `--ip` flag with create-base.rb
+- Check: `utmctl ip-address <vm-name>`
 
 **"Device busy" errors**
 - Force quit UTM, retry
@@ -239,6 +287,12 @@ kodemachine attach <label>
 **OSStatus -1712 / -10004**
 - Apple Events timeout during I/O
 - Usually transient, script retries
+
+## Design Notes
+
+- **No gem dependencies**: All scripts use Ruby standard library only (`json`, `fileutils`, `open3`, `optparse`). Works with macOS system Ruby.
+- **No Brewfile**: Dependencies (UTM, qemu) installed imperatively by setup-host.rb.
+- **Stateless scripts**: No daemon, no database. Config is a single JSON file.
 
 ## License
 
