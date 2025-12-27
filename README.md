@@ -29,7 +29,7 @@ Kodemachine gives you **disposable Linux VMs that boot in seconds**:
 ./setup-host.rb
 
 # 2. Create base image (every ~6 months)
-./create-base.rb --ssh-key ~/.ssh/id_ed25519.pub
+./create-base.rb
 
 # 3. Daily workflow
 kodemachine start myproject
@@ -86,11 +86,11 @@ This will:
 Run every ~6 months (or when you want a fresh golden image):
 
 ```bash
-# Minimal: just provision an existing Ubuntu VM
+# Standard: provisions Ubuntu VM with your SSH key auto-detected
 ./create-base.rb
 
-# With SSH key
-./create-base.rb --ssh-key ~/.ssh/id_ed25519.pub
+# With dotfiles
+./create-base.rb --dotfiles git@github.com:you/dotfiles.git
 
 # Skip GUI for headless-only use
 ./create-base.rb --skip-gui --skip-browsers
@@ -99,14 +99,14 @@ Run every ~6 months (or when you want a fresh golden image):
 ### Options
 
 ```
--n, --name NAME        Base image name (default: kodeimage-vYYYY.MM)
--u, --user USER        SSH username (default: kodeman)
--k, --ssh-key PATH     SSH public key to inject
--d, --dotfiles REPO    Git repo URL for dotfiles
-    --ip ADDRESS       Manual IP if auto-detection fails
-    --skip-gui         Skip XFCE installation
-    --skip-browsers    Skip Firefox/Chromium
--v, --verbose          Show SSH commands
+-n, --name NAME          Base image name (default: kodeimage-vYYYY.MM)
+-u, --user USER          SSH username (default: kodeman)
+-k, --host-ssh-key PATH  Host's public key (default: ~/.ssh/id_ed25519.pub)
+-d, --dotfiles REPO      Git repo URL for dotfiles
+    --ip ADDRESS         Manual IP if auto-detection fails
+    --skip-gui           Skip XFCE installation
+    --skip-browsers      Skip Firefox/Chromium
+-v, --verbose            Show SSH commands
 ```
 
 ### What It Installs

@@ -69,7 +69,7 @@ module KodemachineBase
       @options = {
         name: nil,           # Base image name (auto-versioned)
         ssh_user: DEFAULT_SSH_USER,
-        ssh_key: nil,        # Path to public key
+        host_ssh_key: nil,   # Path to host's public key (auto-detected if not provided)
         dotfiles_repo: nil,  # Git repo URL
         skip_gui: false,
         skip_browsers: false,
@@ -79,6 +79,17 @@ module KodemachineBase
 
       @version = Time.now.strftime("%Y.%m")
       @base_name = @options[:name] || "#{DEFAULT_BASE_NAME}-v#{@version}"
+
+      # Auto-detect host SSH key if not provided
+      @options[:host_ssh_key] ||= detect_host_ssh_key
+    end
+
+    def detect_host_ssh_key
+      candidates = [
+        File.expand_path("~/.ssh/id_ed25519.pub"),
+        File.expand_path("~/.ssh/id_rsa.pub")
+      ]
+      candidates.find { |path| File.exist?(path) }
     end
 
     def run
@@ -90,7 +101,7 @@ module KodemachineBase
       wait_for_ssh
       provision_vm
       install_dotfiles if @options[:dotfiles_repo]
-      inject_ssh_key if @options[:ssh_key]
+      inject_ssh_key if @options[:host_ssh_key]
       prepare_for_cloning
       finalize
 
@@ -375,21 +386,22 @@ module KodemachineBase
     end
 
     def inject_ssh_key
-      step "Injecting SSH key..."
+      step "Injecting host SSH key..."
 
-      key_path = File.expand_path(@options[:ssh_key])
+      key_path = @options[:host_ssh_key]
       unless File.exist?(key_path)
         error "SSH key not found: #{key_path}"
         return
       end
 
+      substep "Using: #{key_path}"
       key = File.read(key_path).strip
 
       ssh_exec("mkdir -p ~/.ssh && chmod 700 ~/.ssh")
       ssh_exec("echo '#{key}' >> ~/.ssh/authorized_keys")
       ssh_exec("chmod 600 ~/.ssh/authorized_keys")
 
-      success "SSH key injected"
+      success "Host SSH key injected"
     end
 
     def prepare_for_cloning
@@ -499,8 +511,8 @@ module KodemachineBase
           options[:ssh_user] = v
         end
 
-        opts.on("-k", "--ssh-key PATH", "Path to SSH public key to inject") do |v|
-          options[:ssh_key] = v
+        opts.on("-k", "--host-ssh-key PATH", "Host's SSH public key (default: ~/.ssh/id_ed25519.pub)") do |v|
+          options[:host_ssh_key] = v
         end
 
         opts.on("-d", "--dotfiles REPO", "Git repo URL for dotfiles") do |v|
