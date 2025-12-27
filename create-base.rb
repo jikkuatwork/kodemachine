@@ -82,6 +82,17 @@ module KodemachineBase
 
       # Auto-detect host SSH key if not provided
       @options[:host_ssh_key] ||= detect_host_ssh_key
+      unless @options[:host_ssh_key]
+        puts "#{COLORS[:red]}✗ No SSH key found#{COLORS[:reset]}"
+        puts
+        puts "  kodemachine needs your public key to enable SSH access to VMs."
+        puts
+        puts "  Create one with:"
+        puts "    ssh-keygen -t ed25519"
+        puts
+        puts "  Then run this script again."
+        exit 1
+      end
     end
 
     def detect_host_ssh_key
