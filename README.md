@@ -38,24 +38,24 @@ kodemachine start myproject
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ macOS Host                                                  │
-│                                                             │
-│   setup-host.rb      One-time: Install UTM, dependencies   │
-│         │                                                   │
-│         ▼                                                   │
-│   create-base.rb     Every ~6 months: Build golden image   │
-│         │            - Ubuntu + GUI + browsers              │
-│         │            - SSH key baked in                     │
-│         ▼                                                   │
-│   kodemachine.rb     Daily: Clone, start, stop, delete     │
-│         │                                                   │
-│         ▼                                                   │
-│   ┌─────────────────────────────────────────────────────┐  │
-│   │ km-myproject (APFS clone)                           │  │
-│   │   └── Your code, containers, etc.                   │  │
-│   └─────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ macOS Host                                                │
+│                                                           │
+│   setup-host.rb      One-time: Install UTM, dependencies  │
+│         │                                                 │
+│         ▼                                                 │
+│   create-base.rb     Every ~6 months: Build golden image  │
+│         │            - Ubuntu + GUI + browsers            │
+│         │            - SSH key baked in                   │
+│         ▼                                                 │
+│   kodemachine.rb     Daily: Clone, start, stop, delete    │
+│         │                                                 │
+│         ▼                                                 │
+│   ┌───────────────────────────────────────────────────┐   │
+│   │ km-myproject (APFS clone)                         │   │
+│   │   └── Your code, containers, etc.                 │   │
+│   └───────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ## Files
