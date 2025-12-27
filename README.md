@@ -35,7 +35,7 @@ instructions), **agency** (autonomous operation), and **tools** (filesystem and
 network access). Attackers accomplished 80-90% of the campaign through AI
 automation.
 
-Meanwhile, researchers like [Dr. Anish Mohammed warn][2] about broader risks:
+Meanwhile, researchers like [Dr. Anish Mohammed][@anish] ([talk][2]) warn about broader risks:
 LLMs with access to lab equipment, sequencers, or critical infrastructure. The
 same autonomy that makes AI assistants useful makes them dangerous when
 compromised or misused.
@@ -48,6 +48,7 @@ directory, not your SSH keys, credentials, or other projects.
 [1]: https://www.anthropic.com/news/disrupting-AI-espionage
 [2]: https://www.youtube.com/watch?v=3bMsWeWR7hI
 [3]: https://github.com/jikkuatwork/testman
+[@anish]: https://x.com/anishmohammed
 
 ## Quick Start
 
