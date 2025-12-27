@@ -311,6 +311,11 @@ kodemachine attach <label>
 - **No Brewfile**: Dependencies (UTM, qemu) installed imperatively by setup-host.rb.
 - **Stateless scripts**: No daemon, no database. Config is a single JSON file.
 
+## Related
+
+- [testman](https://github.com/jikkuatwork/testman) - Container sandboxing layer
+- [Blog: Disposable Dev Environments](https://jikkujose.in/2025/12/27/disposable-dev-environments.html) - Architecture overview
+
 ## License
 
 MIT
