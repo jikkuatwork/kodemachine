@@ -48,7 +48,7 @@ module Kodemachine
       bytes.map { |b| format('%02X', b) }.join(':')
     end
 
-    def apfs_clone(name, attach_shared_disk: true, headless: true)
+    def apfs_clone(name, attach_shared_disk: true, headless: true, isolated: false)
       base_path = "#{UTM_DOCS}/#{@config['base_image']}.utm"
       clone_path = "#{UTM_DOCS}/#{name}.utm"
 
@@ -74,6 +74,14 @@ module Kodemachine
       if headless
         puts "👻 Headless mode (no display)"
         content = strip_display(content)
+      end
+
+      # Set network mode (bridged by default, NAT if isolated)
+      if isolated
+        puts "🔒 Isolated mode (NAT networking)"
+      else
+        puts "🌐 Bridged networking (accessible from local network)"
+        content = set_bridged_network(content)
       end
 
       # Attach shared disk if configured and requested
@@ -103,6 +111,22 @@ module Kodemachine
       plist_content.sub(
         /<key>Display<\/key>\s*<array>.*?<\/array>/m,
         "<key>Display</key>\n\t<array>\n\t</array>"
+      )
+    end
+
+    def set_bridged_network(plist_content)
+      # Change network mode from Shared to Bridged
+      plist_content.gsub(
+        /<key>Mode<\/key>\s*<string>Shared<\/string>/,
+        "<key>Mode</key>\n\t\t\t<string>Bridged</string>"
+      )
+    end
+
+    def set_nat_network(plist_content)
+      # Change network mode from Bridged to Shared (NAT)
+      plist_content.gsub(
+        /<key>Mode<\/key>\s*<string>Bridged<\/string>/,
+        "<key>Mode</key>\n\t\t\t<string>Shared</string>"
       )
     end
 
@@ -154,7 +178,7 @@ module Kodemachine
       plist_content.sub(/(\t<\/array>\n\t<key>Information)/, disk_entry + "\t</array>\n\t<key>Information")
     end
 
-    def ensure_running(label, gui: false, attach_disk: true)
+    def ensure_running(label, gui: false, attach_disk: true, isolated: false)
       abort "❌ Label required. Run 'kodemachine' for help." unless label
 
       # Strip prefix if accidentally included
@@ -162,7 +186,7 @@ module Kodemachine
       label = label.sub(/^#{Regexp.escape(prefix)}/, '')
 
       # Prevent "start" or other commands being used as labels
-      reserved = %w[list doctor delete attach status stop suspend]
+      reserved = %w[list doctor delete attach status stop suspend bridge unbridge isolate]
       abort "❌ '#{label}' is a reserved command." if reserved.include?(label)
 
       # Special case: "base" starts the base image directly (for modifications)
@@ -203,7 +227,7 @@ module Kodemachine
           end
 
           puts "🏗️  Cloning #{@config['base_image']} -> #{name}..."
-          apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui)
+          apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui, isolated: isolated)
         end
       end
 
@@ -239,7 +263,7 @@ module Kodemachine
     def initialize
       @config  = load_config
       @manager = Manager.new(@config)
-      @options = { gui: false, no_disk: false }
+      @options = { gui: false, no_disk: false, isolated: false }
     end
 
     # Strip prefix if user accidentally includes it
@@ -265,6 +289,8 @@ module Kodemachine
       when "stop"    then vm_stop(normalize_label(args.shift))
       when "suspend" then vm_suspend(normalize_label(args.shift))
       when "delete"  then vm_delete(normalize_label(args.shift))
+      when "bridge"  then vm_bridge(normalize_label(args.shift))
+      when "unbridge", "isolate" then vm_unbridge(normalize_label(args.shift))
       else
         puts "❌ Unknown command: #{command}"
         puts "   Run 'kodemachine' for help."
@@ -278,6 +304,7 @@ module Kodemachine
         opts.banner = "Usage: kodemachine [command|label] [options]"
         opts.on("--gui", "Run with window visible") { @options[:gui] = true }
         opts.on("--no-disk", "Don't attach shared projects disk") { @options[:no_disk] = true }
+        opts.on("--isolated", "Use NAT networking (default: bridged)") { @options[:isolated] = true }
         opts.on("-h", "--help") { show_help; exit }
       end
     end
@@ -294,6 +321,8 @@ module Kodemachine
           stop <label>      Shutdown VM
           suspend <label>   Pause VM to memory (fast resume)
           delete <label>    Remove VM entirely
+          bridge <label>    Switch VM to bridged networking
+          isolate <label>   Switch VM to NAT networking (alias: unbridge)
           status            Show system overview
           status <label>    Show specific VM status
           list              List all VMs (including base image)
@@ -303,6 +332,7 @@ module Kodemachine
         Options:
           --gui             Start with display (only one GUI VM allowed)
           --no-disk         Don't attach shared projects disk
+          --isolated        Use NAT networking (default: bridged)
           -h, --help        Show this help
 
         Examples:
@@ -321,7 +351,7 @@ module Kodemachine
     end
 
     def spawn(label)
-      vm = @manager.ensure_running(label, gui: @options[:gui], attach_disk: !@options[:no_disk])
+      vm = @manager.ensure_running(label, gui: @options[:gui], attach_disk: !@options[:no_disk], isolated: @options[:isolated])
 
       # Try instant IP first (works for resumed/already running VMs)
       ip = vm.ip
@@ -676,6 +706,58 @@ module Kodemachine
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
       system("utmctl attach #{name}")
+    end
+
+    def vm_bridge(label)
+      return puts "Provide a label" unless label
+      name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
+      vm = VM.new(name)
+      return puts "❌ VM '#{name}' not found" unless vm.exists?
+
+      status = vm.status
+      unless status.include?('stopped')
+        puts "❌ VM must be stopped first. Run: kodemachine stop #{label}"
+        return
+      end
+
+      plist_path = "#{UTM_DOCS}/#{name}.utm/config.plist"
+      content = File.read(plist_path)
+
+      if content.include?('<string>Bridged</string>')
+        puts "✅ Already using bridged networking"
+        return
+      end
+
+      content = @manager.set_bridged_network(content)
+      File.write(plist_path, content)
+      puts "🌐 Switched to bridged networking"
+      puts "   Start with: kodemachine start #{label}"
+    end
+
+    def vm_unbridge(label)
+      return puts "Provide a label" unless label
+      name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
+      vm = VM.new(name)
+      return puts "❌ VM '#{name}' not found" unless vm.exists?
+
+      status = vm.status
+      unless status.include?('stopped')
+        puts "❌ VM must be stopped first. Run: kodemachine stop #{label}"
+        return
+      end
+
+      plist_path = "#{UTM_DOCS}/#{name}.utm/config.plist"
+      content = File.read(plist_path)
+
+      unless content.include?('<string>Bridged</string>')
+        puts "✅ Already using NAT networking"
+        return
+      end
+
+      content = @manager.set_nat_network(content)
+      File.write(plist_path, content)
+      puts "🔒 Switched to NAT networking (isolated)"
+      puts "   Start with: kodemachine start #{label}"
     end
   end
 end
