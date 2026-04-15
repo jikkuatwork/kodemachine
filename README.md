@@ -1,6 +1,6 @@
 # Kodemachine
 
-Ephemeral VM manager for macOS.
+Ephemeral VM manager for macOS and Linux.
 
 ```bash
 kodemachine start myproject   # Create clone, boot, SSH in
@@ -17,10 +17,11 @@ kodemachine delete myproject  # Gone
 
 Kodemachine gives you **disposable Linux VMs that boot in seconds**:
 
-- **Instant clones** - APFS copy-on-write, zero disk overhead
+- **Instant clones** - APFS (macOS) or qcow2 backing files (Linux), zero disk overhead
 - **Headless** - VMs run as background processes
 - **SSH-native** - `start` drops you into a shell
 - **Persistent storage** - Optional encrypted LUKS disk
+- **Multi-platform** - Same CLI on macOS (UTM) and Linux (libvirt/KVM)
 
 ## Why Now: Isolating AI Agents
 
@@ -52,6 +53,8 @@ directory, not your SSH keys, credentials, or other projects.
 
 ## Quick Start
 
+### macOS
+
 ```bash
 # 1. Setup host (once per Mac)
 ./setup-host.rb
@@ -63,24 +66,42 @@ directory, not your SSH keys, credentials, or other projects.
 kodemachine start myproject
 ```
 
+### Linux
+
+```bash
+# 1. Setup host (once — installs libvirt, creates storage pool)
+./setup-host.rb
+
+# 2. Create a base Ubuntu VM in virt-manager (or virt-install)
+#    Name it "ubuntu-base", install Ubuntu, enable SSH
+
+# 3. Provision the base image
+./create-base.rb
+
+# 4. Daily workflow
+kodemachine start myproject
+```
+
 ## Architecture
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ macOS Host                                                │
+│ Host (macOS or Linux)                                     │
 │                                                           │
-│   setup-host.rb      One-time: Install UTM, dependencies  │
-│         │                                                 │
+│   setup-host.rb      One-time: Install dependencies       │
+│         │            macOS: UTM + Homebrew                │
+│         │            Linux: libvirt + KVM + storage pool  │
 │         ▼                                                 │
 │   create-base.rb     Every ~6 months: Build golden image  │
 │         │            - Ubuntu + GUI + browsers            │
 │         │            - SSH key baked in                   │
 │         ▼                                                 │
 │   kodemachine.rb     Daily: Clone, start, stop, delete    │
-│         │                                                 │
+│         │            macOS: UTM backend (APFS clones)    │
+│         │            Linux: libvirt backend (qcow2 CoW)  │
 │         ▼                                                 │
 │   ┌───────────────────────────────────────────────────┐   │
-│   │ km-myproject (APFS clone)                         │   │
+│   │ km-myproject (instant clone)                      │   │
 │   │   └── Your code, containers, etc.                 │   │
 │   └───────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────┘
@@ -90,22 +111,30 @@ kodemachine start myproject
 
 | File | Purpose | When to Run |
 |------|---------|-------------|
-| `setup-host.rb` | Install UTM, qemu-img, create symlinks | Once per Mac |
+| `setup-host.rb` | Install dependencies (UTM or libvirt) | Once per machine |
 | `create-base.rb` | Build golden VM image | Every ~6 months |
 | `kodemachine.rb` | VM lifecycle (start/stop/clone) | Daily |
 
 ## Setup Host
 
-Run once on a new Mac:
+Run once on a new machine:
 
 ```bash
 ./setup-host.rb
 ```
 
-This will:
+### macOS
 - Check/install Homebrew
 - Install UTM (VM hypervisor)
 - Install qemu-img (disk tools)
+- Create config directory
+- Setup `kodemachine` command symlink
+
+### Linux
+- Check KVM, libvirt, virsh, qemu-img
+- Ensure user is in `libvirt` group
+- Activate default NAT network
+- Create `kodemachine` libvirt storage pool (~/.local/share/kodemachine/images/)
 - Create config directory
 - Setup `kodemachine` command symlink
 
@@ -307,8 +336,9 @@ kodemachine attach <label>
 
 ## Design Notes
 
-- **No gem dependencies**: All scripts use Ruby standard library only (`json`, `fileutils`, `open3`, `optparse`). Works with macOS system Ruby.
-- **No Brewfile**: Dependencies (UTM, qemu) installed imperatively by setup-host.rb.
+- **No gem dependencies**: All scripts use Ruby standard library only (`json`, `fileutils`, `open3`, `optparse`, `rexml`, `securerandom`). Works with system Ruby on macOS and Linux.
+- **Backend abstraction**: Platform-specific logic (UTM vs libvirt) is encapsulated in backend classes. Same CLI, same config format, same workflow.
+- **No Brewfile**: Dependencies installed imperatively by setup-host.rb (Homebrew on macOS, apt on Linux).
 - **Stateless scripts**: No daemon, no database. Config is a single JSON file.
 
 ## Related

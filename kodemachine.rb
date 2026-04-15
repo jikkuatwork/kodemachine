@@ -4,98 +4,191 @@
 require 'json'
 require 'fileutils'
 require 'optparse'
+require 'securerandom'
+require 'tempfile'
 
 module Kodemachine
   VERSION      = "2.0.0"
   CONFIG_DIR   = File.expand_path("~/.config/kodemachine")
   CONFIG_FILE  = File.join(CONFIG_DIR, "config.json")
-  UTM_DOCS     = File.expand_path("~/Library/Containers/com.utmapp.UTM/Data/Documents")
-  QEMU_IMG     = "/opt/homebrew/bin/qemu-img"
 
   DEFAULT_CONFIG = {
     'base_image'  => 'kodeimage-v0.1.0',
     'ssh_user'    => 'kodeman',
     'prefix'      => 'km-',
     'headless'    => true,
-    'shared_disk' => 'Shared/projects-luks.qcow2'  # Relative to UTM_DOCS
+    'shared_disk' => 'Shared/projects-luks.qcow2'
   }.freeze
 
-  class VM
-    attr_reader :name
-    def initialize(name); @name = name; end
-
-    def status
-      `utmctl status #{@name} 2>/dev/null`.strip.downcase
-    end
-
-    def ip
-      output = `utmctl ip-address #{@name} 2>/dev/null`
-      output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)&.[](1)
-    end
-
-    def exists?
-      `utmctl list 2>/dev/null`.include?(@name)
+  def self.detect_platform
+    if RUBY_PLATFORM.include?('darwin')
+      :macos
+    elsif RUBY_PLATFORM.include?('linux')
+      :linux
+    else
+      abort "❌ Unsupported platform: #{RUBY_PLATFORM}"
     end
   end
 
-  class Manager
-    def initialize(config); @config = config; end
+  def self.create_backend(config)
+    case detect_platform
+    when :macos then UtmBackend.new(config)
+    when :linux then LibvirtBackend.new(config)
+    end
+  end
 
-    def generate_mac_address
-      # Generate random MAC with locally administered bit set (x2:xx:xx:xx:xx:xx)
-      # Using 02 prefix ensures it's a locally administered unicast address
-      bytes = [0x02] + 5.times.map { rand(256) }
-      bytes.map { |b| format('%02X', b) }.join(':')
+  # ── macOS Backend (UTM + APFS) ─────────────────────────────────────────────
+
+  class UtmBackend
+    UTM_DOCS = File.expand_path("~/Library/Containers/com.utmapp.UTM/Data/Documents")
+    QEMU_IMG = "/opt/homebrew/bin/qemu-img"
+
+    def initialize(config)
+      @config = config
     end
 
-    def apfs_clone(name, attach_shared_disk: true, headless: true, isolated: false)
-      base_path = "#{UTM_DOCS}/#{@config['base_image']}.utm"
-      clone_path = "#{UTM_DOCS}/#{name}.utm"
+    def images_dir;    UTM_DOCS; end
+    def qemu_img_path; QEMU_IMG; end
 
+    def list_vms
+      `utmctl list 2>/dev/null`.split("\n").map do |line|
+        parts = line.split(/\s+/)
+        next unless parts.size >= 3
+        { name: parts[2], status: parts[1] }
+      end.compact
+    end
+
+    def vm_exists?(name)
+      `utmctl list 2>/dev/null`.include?(name)
+    end
+
+    def vm_status(name)
+      `utmctl status #{name} 2>/dev/null`.strip.downcase
+    end
+
+    def vm_ip(name)
+      output = `utmctl ip-address #{name} 2>/dev/null`
+      output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)&.[](1)
+    end
+
+    def start_vm(name, headless: true)
+      mode = headless ? "--hide" : ""
+      `utmctl start #{name} #{mode} 2>/dev/null`
+    end
+
+    def resume_vm(name)
+      `utmctl start #{name} 2>/dev/null`
+    end
+
+    def stop_vm(name)
+      system("utmctl", "stop", name)
+    end
+
+    def suspend_vm(name)
+      system("utmctl", "suspend", name)
+    end
+
+    def delete_vm(name)
+      system("utmctl", "delete", name)
+    end
+
+    def attach_vm(name)
+      system("utmctl", "attach", name)
+    end
+
+    def guest_exec(name, cmd)
+      output = `utmctl exec "#{name}" --cmd #{cmd} 2>/dev/null`.strip
+      output.empty? ? nil : output
+    end
+
+    def inject_hostname(name)
+      system("utmctl exec #{name} hostnamectl set-hostname #{name} 2>/dev/null")
+    end
+
+    def vm_cpu_count(name)
+      content = read_plist(name)
+      return nil unless content
+      match = content.match(/<key>CPUCount<\/key>\s*<integer>(\d+)<\/integer>/)
+      match ? match[1].to_i : nil
+    end
+
+    def vm_memory_mb(name)
+      content = read_plist(name)
+      return nil unless content
+      match = content.match(/<key>MemorySize<\/key>\s*<integer>(\d+)<\/integer>/)
+      match ? match[1].to_i : nil
+    end
+
+    def vm_storage_path(name)
+      "#{UTM_DOCS}/#{name}.utm"
+    end
+
+    def vm_disk_files(name)
+      Dir.glob("#{vm_storage_path(name)}/Data/*.qcow2").reject { |f| File.symlink?(f) }
+    end
+
+    def has_display?(name)
+      content = read_plist(name)
+      return false unless content
+      content.match?(/<key>Display<\/key>\s*<array>\s*<dict>/)
+    end
+
+    def has_shared_disk?(name)
+      link_path = "#{vm_storage_path(name)}/Data/shared-projects.qcow2"
+      File.exist?(link_path) || File.symlink?(link_path)
+    end
+
+    def shared_disk_path
+      sd = @config['shared_disk']
+      return nil unless sd
+      "#{UTM_DOCS}/#{sd}"
+    end
+
+    def is_bridged?(name)
+      content = read_plist(name)
+      return false unless content
+      content.include?('<string>Bridged</string>')
+    end
+
+    def clone_base(base_name, clone_name, headless: true, isolated: false, attach_shared_disk: true)
+      base_path = "#{UTM_DOCS}/#{base_name}.utm"
+      clone_path = "#{UTM_DOCS}/#{clone_name}.utm"
       abort "❌ Base image not found: #{base_path}" unless File.exist?(base_path)
 
       # APFS Copy-on-Write clone (instant, zero extra space)
       system("cp", "-Rc", base_path, clone_path)
 
-      # Update VM name and UUID in config
       plist = "#{clone_path}/config.plist"
       content = File.read(plist)
+
       content.gsub!(/<key>Name<\/key>\s*<string>[^<]+<\/string>/,
-                    "<key>Name</key>\n\t\t<string>#{name}</string>")
+                    "<key>Name</key>\n\t\t<string>#{clone_name}</string>")
       content.gsub!(/<key>UUID<\/key>\s*<string>[^<]+<\/string>/,
-                    "<key>UUID</key>\n\t\t<string>#{`uuidgen`.strip}</string>")
-
-      # Generate unique MAC address for each clone (required for unique DHCP IP)
-      new_mac = generate_mac_address
+                    "<key>UUID</key>\n\t\t<string>#{SecureRandom.uuid.upcase}</string>")
       content.gsub!(/<key>MacAddress<\/key>\s*<string>[^<]+<\/string>/,
-                    "<key>MacAddress</key>\n\t\t\t<string>#{new_mac}</string>")
+                    "<key>MacAddress</key>\n\t\t\t<string>#{generate_mac_address}</string>")
 
-      # Remove display for headless mode (allows multiple VMs)
       if headless
         puts "👻 Headless mode (no display)"
         content = strip_display(content)
       end
 
-      # Set network mode (bridged by default, NAT if isolated)
       if isolated
         puts "🔒 Isolated mode (NAT networking)"
       else
         puts "🌐 Bridged networking (accessible from local network)"
-        content = set_bridged_network(content)
+        content = apply_bridged_network(content)
       end
 
-      # Attach shared disk if configured and requested
       if attach_shared_disk && @config['shared_disk']
-        shared_path = "#{UTM_DOCS}/#{@config['shared_disk']}"
-        if File.exist?(shared_path)
+        shared = shared_disk_path
+        if shared && File.exist?(shared)
           puts "📎 Attaching shared disk: #{@config['shared_disk']}"
-          # Create symlink inside VM bundle (UTM expects disks in Data folder)
           link_name = "shared-projects.qcow2"
-          link_path = "#{clone_path}/Data/#{link_name}"
-          FileUtils.ln_sf(shared_path, link_path)
-          content = inject_shared_disk(content, link_name)  # Use relative name
+          FileUtils.ln_sf(shared, "#{clone_path}/Data/#{link_name}")
+          content = inject_shared_disk_plist(content, link_name)
         else
-          puts "⚠️  Shared disk not found: #{shared_path}"
+          puts "⚠️  Shared disk not found: #{shared}"
         end
       end
 
@@ -103,170 +196,480 @@ module Kodemachine
 
       # Register with UTM
       system("open", "-a", "UTM", clone_path)
-      sleep 1 # Let UTM register it
+      sleep 1
     end
 
-    def strip_display(plist_content)
-      # Replace Display array with empty array (removes GPU device)
-      plist_content.sub(
-        /<key>Display<\/key>\s*<array>.*?<\/array>/m,
-        "<key>Display</key>\n\t<array>\n\t</array>"
-      )
+    def set_bridged_network(name)
+      plist_path = "#{vm_storage_path(name)}/config.plist"
+      content = File.read(plist_path)
+      content = apply_bridged_network(content)
+      File.write(plist_path, content)
     end
 
-    def set_bridged_network(plist_content)
-      # Change network mode from Shared to Bridged
-      plist_content.gsub(
-        /<key>Mode<\/key>\s*<string>Shared<\/string>/,
-        "<key>Mode</key>\n\t\t\t<string>Bridged</string>"
-      )
+    def set_nat_network(name)
+      plist_path = "#{vm_storage_path(name)}/config.plist"
+      content = File.read(plist_path)
+      content = apply_nat_network(content)
+      File.write(plist_path, content)
     end
 
-    def set_nat_network(plist_content)
-      # Change network mode from Bridged to Shared (NAT)
-      plist_content.gsub(
-        /<key>Mode<\/key>\s*<string>Bridged<\/string>/,
-        "<key>Mode</key>\n\t\t\t<string>Shared</string>"
-      )
+    private
+
+    def read_plist(name)
+      path = "#{vm_storage_path(name)}/config.plist"
+      File.exist?(path) ? File.read(path) : nil
     end
 
-    def gui_vm_running?
-      # Check if any VM with display is currently running
-      prefix = @config['prefix']
-      running_vms = `utmctl list 2>/dev/null`.split("\n").select { |l| l.include?(prefix) && l.include?('started') }
+    def generate_mac_address
+      bytes = [0x02] + 5.times.map { rand(256) }
+      bytes.map { |b| format('%02X', b) }.join(':')
+    end
 
-      running_vms.any? do |line|
-        vm_name = line.split(/\s+/)[2]
-        plist_path = "#{UTM_DOCS}/#{vm_name}.utm/config.plist"
-        next false unless File.exist?(plist_path)
-        content = File.read(plist_path)
-        # Check if Display array has content (not empty)
-        content.match?(/<key>Display<\/key>\s*<array>\s*<dict>/)
+    def strip_display(content)
+      content.sub(/<key>Display<\/key>\s*<array>.*?<\/array>/m,
+                  "<key>Display</key>\n\t<array>\n\t</array>")
+    end
+
+    def apply_bridged_network(content)
+      content.gsub(/<key>Mode<\/key>\s*<string>Shared<\/string>/,
+                   "<key>Mode</key>\n\t\t\t<string>Bridged</string>")
+    end
+
+    def apply_nat_network(content)
+      content.gsub(/<key>Mode<\/key>\s*<string>Bridged<\/string>/,
+                   "<key>Mode</key>\n\t\t\t<string>Shared</string>")
+    end
+
+    def inject_shared_disk_plist(content, disk_path)
+      entry = "\t\t<dict>\n" \
+              "\t\t\t<key>Identifier</key>\n" \
+              "\t\t\t<string>#{SecureRandom.uuid.upcase}</string>\n" \
+              "\t\t\t<key>ImageName</key>\n" \
+              "\t\t\t<string>#{disk_path}</string>\n" \
+              "\t\t\t<key>ImageType</key>\n" \
+              "\t\t\t<string>Disk</string>\n" \
+              "\t\t\t<key>Interface</key>\n" \
+              "\t\t\t<string>VirtIO</string>\n" \
+              "\t\t\t<key>InterfaceVersion</key>\n" \
+              "\t\t\t<integer>1</integer>\n" \
+              "\t\t\t<key>ReadOnly</key>\n" \
+              "\t\t\t<false/>\n" \
+              "\t\t</dict>\n"
+      content.sub(/(\t<\/array>\n\t<key>Information)/, entry + "\t</array>\n\t<key>Information")
+    end
+  end
+
+  # ── Linux Backend (libvirt + qcow2) ────────────────────────────────────────
+
+  class LibvirtBackend
+    VIRSH_URI = "qemu:///system"
+
+    def initialize(config)
+      require 'rexml/document'
+      @config = config
+      @images_dir = File.expand_path("~/.local/share/kodemachine/images")
+    end
+
+    def images_dir;    @images_dir; end
+    def qemu_img_path; @qemu_img ||= find_qemu_img; end
+
+    def list_vms
+      `virsh -c #{VIRSH_URI} list --all 2>/dev/null`.split("\n").map do |line|
+        line = line.strip
+        next if line.empty? || line.start_with?('Id') || line.start_with?('-')
+        parts = line.split(/\s+/, 3)
+        next unless parts.size >= 3
+        { name: parts[1], status: normalize_status(parts[2]) }
+      end.compact
+    end
+
+    def vm_exists?(name)
+      system("virsh", "-c", VIRSH_URI, "dominfo", name, out: File::NULL, err: File::NULL)
+    end
+
+    def vm_status(name)
+      normalize_status(`virsh -c #{VIRSH_URI} domstate #{name} 2>/dev/null`.strip)
+    end
+
+    def vm_ip(name)
+      # Try guest agent first, then DHCP leases
+      output = `virsh -c #{VIRSH_URI} domifaddr #{name} --source agent 2>/dev/null`
+      match = output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
+      return match[1] if match
+
+      output = `virsh -c #{VIRSH_URI} domifaddr #{name} --source lease 2>/dev/null`
+      match = output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
+      match&.[](1)
+    end
+
+    def start_vm(name, headless: true)
+      # Linux VMs are always headless via libvirt (use virt-viewer separately for GUI)
+      `virsh -c #{VIRSH_URI} start #{name} 2>/dev/null`
+    end
+
+    def resume_vm(name)
+      `virsh -c #{VIRSH_URI} resume #{name} 2>/dev/null`
+    end
+
+    def stop_vm(name)
+      system("virsh", "-c", VIRSH_URI, "shutdown", name)
+    end
+
+    def suspend_vm(name)
+      system("virsh", "-c", VIRSH_URI, "suspend", name)
+    end
+
+    def delete_vm(name)
+      disk = vm_main_disk(name)
+      system("virsh", "-c", VIRSH_URI, "destroy", name, out: File::NULL, err: File::NULL)
+      system("virsh", "-c", VIRSH_URI, "undefine", name)
+      FileUtils.rm_f(disk) if disk
+    end
+
+    def attach_vm(name)
+      system("virsh", "-c", VIRSH_URI, "console", name)
+    end
+
+    def guest_exec(name, cmd)
+      ip = vm_ip(name)
+      return nil unless ip
+      output = `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 -o LogLevel=ERROR #{@config['ssh_user']}@#{ip} #{cmd} 2>/dev/null`.strip
+      $?.success? && !output.empty? ? output : nil
+    end
+
+    def inject_hostname(name)
+      guest_exec(name, "sudo hostnamectl set-hostname #{name}")
+    end
+
+    def vm_cpu_count(name)
+      xml = dumpxml(name)
+      return nil unless xml
+      match = xml.match(/<vcpu[^>]*>(\d+)<\/vcpu>/)
+      match ? match[1].to_i : nil
+    end
+
+    def vm_memory_mb(name)
+      xml = dumpxml(name)
+      return nil unless xml
+      match = xml.match(/<memory unit='(\w+)'>(\d+)<\/memory>/)
+      return nil unless match
+      unit, value = match[1], match[2].to_i
+      case unit
+      when "KiB" then value / 1024
+      when "MiB" then value
+      when "GiB" then value * 1024
+      else value / 1024
       end
     end
 
-    def shared_disk_in_use?
-      # Check if any running VM has the shared disk attached
-      prefix = @config['prefix']
-      running_vms = `utmctl list 2>/dev/null`.split("\n").select { |l| l.include?(prefix) && l.include?('started') }
+    def vm_storage_path(name)
+      vm_main_disk(name)
+    end
 
-      running_vms.any? do |line|
-        vm_name = line.split(/\s+/)[2]
-        link_path = "#{UTM_DOCS}/#{vm_name}.utm/Data/shared-projects.qcow2"
-        File.exist?(link_path) || File.symlink?(link_path)
+    def vm_disk_files(name)
+      disk = vm_main_disk(name)
+      disk ? [disk] : []
+    end
+
+    def has_display?(name)
+      xml = dumpxml(name)
+      return false unless xml
+      xml.include?('<graphics')
+    end
+
+    def has_shared_disk?(name)
+      xml = dumpxml(name)
+      return false unless xml
+      shared = shared_disk_path
+      return false unless shared
+      xml.include?(shared)
+    end
+
+    def shared_disk_path
+      sd = @config['shared_disk']
+      return nil unless sd
+      File.join(@images_dir, sd)
+    end
+
+    def is_bridged?(name)
+      xml = dumpxml(name)
+      return false unless xml
+      xml.include?("type='bridge'")
+    end
+
+    def clone_base(base_name, clone_name, headless: true, isolated: false, attach_shared_disk: true)
+      base_disk = vm_main_disk(base_name)
+      abort "❌ Cannot find disk for base image: #{base_name}" unless base_disk
+      abort "❌ Base disk not found: #{base_disk}" unless File.exist?(base_disk)
+
+      # Create qcow2 backing file (instant CoW clone)
+      FileUtils.mkdir_p(@images_dir)
+      clone_disk = File.join(@images_dir, "#{clone_name}.qcow2")
+      system(qemu_img_path, "create", "-f", "qcow2", "-b", base_disk, "-F", "qcow2", clone_disk)
+
+      # Clone base XML and modify
+      xml = dumpxml(base_name)
+      abort "❌ Cannot read base VM configuration" unless xml
+      doc = REXML::Document.new(xml)
+
+      # Identity
+      doc.elements['domain/name'].text = clone_name
+      doc.elements['domain/uuid'].text = SecureRandom.uuid
+
+      # MAC address
+      mac_el = doc.elements['//interface/mac']
+      mac_el.attributes['address'] = generate_mac_address if mac_el
+
+      # Replace main disk, remove extras (CD-ROM, old shared disk, etc.)
+      disks_to_remove = []
+      doc.elements.each('domain/devices/disk') do |disk|
+        target = disk.elements['target']
+        if target && target.attributes['dev'] == 'vda'
+          source = disk.elements['source']
+          source.attributes['file'] = clone_disk if source
+        else
+          disks_to_remove << disk
+        end
+      end
+      disks_to_remove.each { |d| d.parent.delete_element(d) }
+
+      # Network
+      if isolated
+        puts "🔒 Isolated mode (NAT networking)"
+      else
+        puts "🌐 NAT networking (default)"
+      end
+
+      # Headless
+      if headless
+        puts "👻 Headless mode (no display)"
+        remove_xml_elements(doc, '//graphics')
+        remove_xml_elements(doc, '//video')
+      end
+
+      # Shared disk
+      if attach_shared_disk && @config['shared_disk']
+        shared = shared_disk_path
+        if shared && File.exist?(shared)
+          puts "📎 Attaching shared disk: #{@config['shared_disk']}"
+          devices = doc.elements['domain/devices']
+          add_shared_disk_xml(devices, shared)
+        else
+          puts "⚠️  Shared disk not found: #{shared}"
+        end
+      end
+
+      define_domain(doc)
+    end
+
+    def set_bridged_network(name)
+      xml = dumpxml(name)
+      return unless xml
+      doc = REXML::Document.new(xml)
+      iface = doc.elements['//interface']
+      return unless iface
+
+      bridge = detect_host_bridge
+      abort "❌ No bridge device found. Create one first (e.g., br0 via netplan)." unless bridge
+
+      iface.attributes['type'] = 'bridge'
+      source = iface.elements['source']
+      source.attributes.delete('network')
+      source.add_attribute('bridge', bridge)
+      define_domain(doc)
+    end
+
+    def set_nat_network(name)
+      xml = dumpxml(name)
+      return unless xml
+      doc = REXML::Document.new(xml)
+      iface = doc.elements['//interface']
+      return unless iface
+
+      iface.attributes['type'] = 'network'
+      source = iface.elements['source']
+      source.attributes.delete('bridge')
+      source.add_attribute('network', 'default')
+      define_domain(doc)
+    end
+
+    private
+
+    def normalize_status(status)
+      case status
+      when "running"  then "started"
+      when "shut off" then "stopped"
+      when "paused"   then "paused"
+      else status
       end
     end
 
-    def inject_shared_disk(plist_content, disk_path)
-      # Create disk entry XML (matching plist indentation with real tabs)
-      disk_entry = "\t\t<dict>\n" \
-                   "\t\t\t<key>Identifier</key>\n" \
-                   "\t\t\t<string>#{`uuidgen`.strip}</string>\n" \
-                   "\t\t\t<key>ImageName</key>\n" \
-                   "\t\t\t<string>#{disk_path}</string>\n" \
-                   "\t\t\t<key>ImageType</key>\n" \
-                   "\t\t\t<string>Disk</string>\n" \
-                   "\t\t\t<key>Interface</key>\n" \
-                   "\t\t\t<string>VirtIO</string>\n" \
-                   "\t\t\t<key>InterfaceVersion</key>\n" \
-                   "\t\t\t<integer>1</integer>\n" \
-                   "\t\t\t<key>ReadOnly</key>\n" \
-                   "\t\t\t<false/>\n" \
-                   "\t\t</dict>\n"
+    def dumpxml(name)
+      output = `virsh -c #{VIRSH_URI} dumpxml #{name} 2>/dev/null`
+      output.empty? ? nil : output
+    end
 
-      # Insert new disk entry before closing </array> of Drive section
-      plist_content.sub(/(\t<\/array>\n\t<key>Information)/, disk_entry + "\t</array>\n\t<key>Information")
+    def vm_main_disk(name)
+      xml = dumpxml(name)
+      return nil unless xml
+      doc = REXML::Document.new(xml)
+      doc.elements.each('domain/devices/disk') do |disk|
+        target = disk.elements['target']
+        next unless target && target.attributes['dev'] == 'vda'
+        source = disk.elements['source']
+        return source.attributes['file'] if source
+      end
+      nil
+    end
+
+    def generate_mac_address
+      bytes = [0x52, 0x54, 0x00] + 3.times.map { rand(256) }
+      bytes.map { |b| format('%02x', b) }.join(':')
+    end
+
+    def find_qemu_img
+      ["/usr/bin/qemu-img", "/usr/local/bin/qemu-img"].find { |p| File.exist?(p) } || "qemu-img"
+    end
+
+    def detect_host_bridge
+      bridges = `ip -br link show type bridge 2>/dev/null`.split("\n")
+      return nil if bridges.empty?
+      bridges.first.split(/\s+/).first
+    end
+
+    def add_shared_disk_xml(devices, path)
+      disk = devices.add_element('disk', 'type' => 'file', 'device' => 'disk')
+      disk.add_element('driver', 'name' => 'qemu', 'type' => 'qcow2')
+      disk.add_element('source', 'file' => path)
+      disk.add_element('target', 'dev' => 'vdb', 'bus' => 'virtio')
+      disk.add_element('shareable')
+    end
+
+    def remove_xml_elements(doc, xpath)
+      while (el = doc.elements[xpath])
+        el.parent.delete_element(el)
+      end
+    end
+
+    def define_domain(doc)
+      tmp = Tempfile.new(['km-', '.xml'])
+      doc.write(tmp)
+      tmp.close
+      system("virsh", "-c", VIRSH_URI, "define", tmp.path)
+      tmp.unlink
+    end
+  end
+
+  # ── VM State Object ────────────────────────────────────────────────────────
+
+  class VM
+    attr_reader :name
+
+    def initialize(name, backend)
+      @name = name
+      @backend = backend
+    end
+
+    def status;  @backend.vm_status(@name); end
+    def ip;      @backend.vm_ip(@name); end
+    def exists?; @backend.vm_exists?(@name); end
+  end
+
+  # ── Manager ────────────────────────────────────────────────────────────────
+
+  class Manager
+    def initialize(config, backend)
+      @config = config
+      @backend = backend
     end
 
     def ensure_running(label, gui: false, attach_disk: true, isolated: false)
       abort "❌ Label required. Run 'kodemachine' for help." unless label
 
-      # Strip prefix if accidentally included
       prefix = @config['prefix']
       label = label.sub(/^#{Regexp.escape(prefix)}/, '')
 
-      # Prevent "start" or other commands being used as labels
       reserved = %w[list doctor delete attach status stop suspend bridge unbridge isolate]
       abort "❌ '#{label}' is a reserved command." if reserved.include?(label)
 
-      # Special case: "base" starts the base image directly (for modifications)
       is_base = label == 'base'
       name = is_base ? @config['base_image'] : "#{prefix}#{label}"
-      vm = VM.new(name)
+      vm = VM.new(name, @backend)
 
       if is_base
         puts "📦 Starting base image directly (changes will affect future clones)"
         abort "❌ Base image not found: #{name}" unless vm.exists?
 
-        # Warn if clones are running (may cause MAC/IP conflicts with older clones)
-        running_clones = `utmctl list 2>/dev/null`.split("\n")
-          .select { |l| l.include?(prefix) && l.include?('started') }
-          .map { |l| l.split(/\s+/)[2] }
+        running_clones = @backend.list_vms
+          .select { |v| v[:name].include?(prefix) && v[:status] == 'started' }
+          .map { |v| v[:name] }
         unless running_clones.empty?
           puts "⚠️  Warning: Running clones may conflict with base image network"
           puts "   Running: #{running_clones.join(', ')}"
           puts "   Consider stopping them first: kodemachine stop <label>"
         end
       else
-        # Check for existing GUI VM if requesting GUI mode
         if gui && gui_vm_running?
           abort "❌ Cannot start GUI VM: another GUI VM is already running.\n" \
                 "   Stop it first or use headless mode (without --gui)."
         end
 
-        # 1. Clone if missing (using APFS CoW for instant, zero-space clones)
         if vm.exists?
-          # Existing VM - show disk status
-          has_disk = File.symlink?("#{UTM_DOCS}/#{name}.utm/Data/shared-projects.qcow2")
-          puts has_disk ? "📎 Has shared disk" : "💾 No shared disk attached"
+          puts @backend.has_shared_disk?(name) ? "📎 Has shared disk" : "💾 No shared disk attached"
         else
-          # Only check shared disk conflict when creating a new VM
           if attach_disk && shared_disk_in_use?
             puts "⚠️  Shared disk in use by another VM - spawning without it"
             attach_disk = false
           end
-
           puts "🏗️  Cloning #{@config['base_image']} -> #{name}..."
-          apfs_clone(name, attach_shared_disk: attach_disk, headless: !gui, isolated: isolated)
+          @backend.clone_base(@config['base_image'], name,
+                              headless: !gui, isolated: isolated, attach_shared_disk: attach_disk)
         end
       end
 
-      # 2. Start if stopped, or resume if paused/suspended
       status = vm.status
       if status.include?('stopped')
         puts "🚀 Starting #{name}..."
-        mode = (!gui) ? "--hide" : ""
-        `utmctl start #{name} #{mode} 2>/dev/null`
-
-        # Wait for VM to start
-        5.times do
-          break if vm.status.include?('started')
-          sleep 1
-        end
+        @backend.start_vm(name, headless: !gui)
+        5.times { break if vm.status.include?('started'); sleep 1 }
       elsif status.include?('paused') || status.include?('suspended')
         puts "▶️  Resuming #{name}..."
-        `utmctl start #{name} 2>/dev/null`
-
-        # Wait for VM to resume (should be instant)
-        3.times do
-          break if vm.status.include?('started')
-          sleep 0.5
-        end
+        @backend.resume_vm(name)
+        3.times { break if vm.status.include?('started'); sleep 0.5 }
       end
+
       vm
     end
+
+    private
+
+    def gui_vm_running?
+      prefix = @config['prefix']
+      @backend.list_vms
+        .select { |v| v[:name].include?(prefix) && v[:status] == 'started' }
+        .any? { |v| @backend.has_display?(v[:name]) }
+    end
+
+    def shared_disk_in_use?
+      prefix = @config['prefix']
+      @backend.list_vms
+        .select { |v| v[:name].include?(prefix) && v[:status] == 'started' }
+        .any? { |v| @backend.has_shared_disk?(v[:name]) }
+    end
   end
+
+  # ── CLI ────────────────────────────────────────────────────────────────────
 
   class CLI
     def self.run(args); new.execute(args); end
 
     def initialize
       @config  = load_config
-      @manager = Manager.new(@config)
+      @backend = Kodemachine.create_backend(@config)
+      @manager = Manager.new(@config, @backend)
       @options = { gui: false, no_disk: false, isolated: false }
     end
 
-    # Strip prefix if user accidentally includes it
     def normalize_label(label)
       return nil unless label
       prefix = @config['prefix']
@@ -346,20 +749,18 @@ module Kodemachine
     def load_config
       FileUtils.mkdir_p(CONFIG_DIR)
       return DEFAULT_CONFIG.dup unless File.exist?(CONFIG_FILE)
-      # Merge user config with defaults (user values take precedence)
       DEFAULT_CONFIG.merge(JSON.parse(File.read(CONFIG_FILE))) rescue DEFAULT_CONFIG.dup
     end
 
     def spawn(label)
       vm = @manager.ensure_running(label, gui: @options[:gui], attach_disk: !@options[:no_disk], isolated: @options[:isolated])
 
-      # Try instant IP first (works for resumed/already running VMs)
-      ip = vm.ip
+      ip = @backend.vm_ip(vm.name)
 
       unless ip
         puts "🔍 Waiting for IP..."
         30.times do
-          ip = vm.ip
+          ip = @backend.vm_ip(vm.name)
           break if ip
           print "."
           $stdout.flush
@@ -370,94 +771,69 @@ module Kodemachine
 
       if ip
         puts "✅ Ready: #{ip}"
-        # Inject personality
-        system("utmctl exec #{vm.name} hostnamectl set-hostname #{vm.name} 2>/dev/null")
-        # Final SSH
+        @backend.inject_hostname(vm.name)
         exec "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null #{@config['ssh_user']}@#{ip}"
       else
-        puts "❌ IP Timeout. Check VM state in UTM or try: kodemachine attach #{label || vm.name}"
+        puts "❌ IP Timeout. Check VM state or try: kodemachine attach #{label || vm.name}"
       end
     end
 
     def display_list
       prefix = @config['prefix']
-      lines = `utmctl list 2>/dev/null`.split("\n").select { |l| l.include?(prefix) }
-      base_line = `utmctl list 2>/dev/null`.split("\n").find { |l| l.include?(@config['base_image']) }
+      all_vms = @backend.list_vms
+      clone_vms = all_vms.select { |v| v[:name].start_with?(prefix) }
+      base_vm = all_vms.find { |v| v[:name] == @config['base_image'] }
 
-      if lines.empty? && !base_line
+      if clone_vms.empty? && !base_vm
         puts "No VMs found"
         return
       end
 
-      # Collect VM data
-      vms = lines.map do |line|
-        parts = line.split(/\s+/)
-        status = parts[1]
-        name = parts[2]
+      vms = clone_vms.map do |vm_data|
+        name = vm_data[:name]
+        status = vm_data[:status]
         label = name.sub(prefix, '')
-        vm_path = "#{UTM_DOCS}/#{name}.utm"
+        vm_path = @backend.vm_storage_path(name)
 
-        # Created (time ago)
-        created = File.exist?(vm_path) ? time_ago(File.birthtime(vm_path)) : "?"
-
-        # Shared disk usage
-        disk_link = "#{vm_path}/Data/shared-projects.qcow2"
-        disk = if File.symlink?(disk_link)
-          shared_disk_usage
+        created = if vm_path && File.exist?(vm_path)
+          time_ago(file_created_time(vm_path))
         else
-          "NA"
+          "?"
         end
 
-        # RAM - live usage for running VMs, allocated for stopped
-        ram = "?"
-        plist_path = "#{vm_path}/config.plist"
-        if File.exist?(plist_path)
-          content = File.read(plist_path)
-          mem_mb = content.match(/<key>MemorySize<\/key>\s*<integer>(\d+)<\/integer>/)&.[](1)
-          allocated_gb = mem_mb ? mem_mb.to_i / 1024 : nil
+        disk = @backend.has_shared_disk?(name) ? shared_disk_usage : "NA"
 
-          if status == 'started' && allocated_gb
-            # Try live RAM via guest agent
-            ram_out = `utmctl exec "#{name}" --cmd free -m 2>/dev/null`.strip
-            ram_match = ram_out.match(/Mem:\s+(\d+)\s+(\d+)/)
-            if ram_match
-              total_mb = ram_match[1].to_i
-              used_mb = ram_match[2].to_i
-              percent = [(used_mb.to_f / total_mb * 100).round, 1].max
-              ram = format("%02d%% of %dGB", percent, total_mb / 1024)
-            else
-              ram = "#{allocated_gb}GB"
-            end
-          elsif allocated_gb
+        mem_mb = @backend.vm_memory_mb(name)
+        allocated_gb = mem_mb ? mem_mb / 1024 : nil
+        ram = "?"
+
+        if status == 'started' && allocated_gb
+          ram_out = @backend.guest_exec(name, "free -m")
+          ram_match = ram_out&.match(/Mem:\s+(\d+)\s+(\d+)/)
+          if ram_match
+            total_mb = ram_match[1].to_i
+            used_mb = ram_match[2].to_i
+            percent = [(used_mb.to_f / total_mb * 100).round, 1].max
+            ram = format("%02d%% of %dGB", percent, total_mb / 1024)
+          else
             ram = "#{allocated_gb}GB"
           end
+        elsif allocated_gb
+          ram = "#{allocated_gb}GB"
         end
 
-        # Storage usage
-        storage = vm_storage_percent(vm_path)
-
-        # IP address (only for running VMs)
-        ip = status == 'started' ? (VM.new(name).ip || "-") : "-"
+        storage = vm_storage_percent(name)
+        ip = status == 'started' ? (@backend.vm_ip(name) || "-") : "-"
 
         { label: label, status: status, ip: ip, created: created, disk: disk, ram: ram, storage: storage }
       end
 
-      # Add base image as special entry
-      if base_line
-        parts = base_line.split(/\s+/)
-        status = parts[1]
+      if base_vm
         name = @config['base_image']
-        vm_path = "#{UTM_DOCS}/#{name}.utm"
-
-        ram = "?"
-        plist_path = "#{vm_path}/config.plist"
-        if File.exist?(plist_path)
-          content = File.read(plist_path)
-          mem_mb = content.match(/<key>MemorySize<\/key>\s*<integer>(\d+)<\/integer>/)&.[](1)
-          ram = mem_mb ? "#{mem_mb.to_i / 1024}GB" : "?"
-        end
-
-        ip = status == 'started' ? (VM.new(name).ip || "-") : "-"
+        status = base_vm[:status]
+        mem_mb = @backend.vm_memory_mb(name)
+        ram = mem_mb ? "#{mem_mb / 1024}GB" : "?"
+        ip = status == 'started' ? (@backend.vm_ip(name) || "-") : "-"
 
         vms.unshift({
           label: "base",
@@ -466,18 +842,17 @@ module Kodemachine
           created: "-",
           disk: "NA",
           ram: ram,
-          storage: vm_storage_percent(vm_path)
+          storage: vm_storage_percent(name)
         })
       end
 
-      # Status emoji (emoji + status text)
+      # Table formatting
       status_emoji = { 'started' => '🟢', 'stopped' => '⚫', 'suspended' => '🟡', 'paused' => '🟡' }
       vms.each { |v| v[:status_display] = "#{status_emoji[v[:status]] || '⚪'} #{v[:status]}" }
 
-      # Dynamic column widths based on content
       cols = {
         label:   { header: "Label",   values: vms.map { |v| v[:label] } },
-        status:  { header: "Status",  values: vms.map { |v| v[:status] } },  # Use raw status for width calc
+        status:  { header: "Status",  values: vms.map { |v| v[:status] } },
         ip:      { header: "IP",      values: vms.map { |v| v[:ip] } },
         created: { header: "Created", values: vms.map { |v| v[:created] } },
         disk:    { header: "Disk",    values: vms.map { |v| v[:disk] } },
@@ -485,20 +860,17 @@ module Kodemachine
         storage: { header: "Storage", values: vms.map { |v| v[:storage] } }
       }
 
-      # Calculate widths (header or max content, whichever is larger)
       widths = cols.transform_values do |col|
         [col[:header].length, col[:values].map(&:length).max || 0].max
       end
-      widths[:status] += 3  # Account for emoji (2 display chars) + space
+      widths[:status] += 3  # Account for emoji width
 
-      # Header (centered)
       indent = "  "
       puts
       headers = cols.keys.map { |k| cols[k][:header].center(widths[k]) }.join(" │ ")
       puts indent + headers
       puts indent + cols.keys.map { |k| "─" * widths[k] }.join("─┼─")
 
-      # Rows (emoji takes 2 display chars, so pad status accordingly)
       vms.each do |v|
         status_padded = v[:status_display] + " " * (widths[:status] - v[:status].length - 3)
         row = [
@@ -515,74 +887,22 @@ module Kodemachine
       puts
     end
 
-    def time_ago(time)
-      seconds = (Time.now - time).to_i
-      case seconds
-      when 0..59       then "#{seconds}s ago"
-      when 60..3599    then "#{seconds / 60}m ago"
-      when 3600..86399 then "#{seconds / 3600}h ago"
-      else                  "#{seconds / 86400}d ago"
-      end
-    end
-
-    def shared_disk_usage
-      shared_path = "#{UTM_DOCS}/#{@config['shared_disk']}"
-      return "?" unless File.exist?(shared_path)
-
-      # Actual size on disk
-      actual = `du -sk "#{shared_path}" 2>/dev/null`.split("\t").first.to_i * 1024
-
-      # Virtual size from qcow2
-      info = `"#{QEMU_IMG}" info -U "#{shared_path}" 2>/dev/null`
-      match = info.match(/virtual size:.*\((\d+) bytes\)/)
-      return "?" unless match
-
-      virtual = match[1].to_i
-      percent = [(actual.to_f / virtual * 100).round, 1].max
-      virtual_gb = (virtual.to_f / 1024**3).round
-      format("%02d%% of %dGB", percent, virtual_gb)
-    end
-
-    def vm_storage_percent(vm_path)
-      return "?" unless File.exist?(vm_path)
-
-      # Get actual size on disk
-      actual = `du -sk "#{vm_path}" 2>/dev/null`.split("\t").first.to_i * 1024
-
-      # Get virtual size from qcow2 (main disk, excluding symlinks)
-      qcow2_files = Dir.glob("#{vm_path}/Data/*.qcow2").reject { |f| File.symlink?(f) }
-      virtual = 0
-      qcow2_files.each do |f|
-        info = `"#{QEMU_IMG}" info -U "#{f}" 2>/dev/null`
-        if (match = info.match(/virtual size:.*\((\d+) bytes\)/))
-          virtual += match[1].to_i
-        end
-      end
-
-      return "?" if virtual == 0
-
-      percent = [(actual.to_f / virtual * 100).round, 1].max
-      virtual_gb = (virtual.to_f / 1024**3).round
-      format("%02d%% of %dGB", percent, virtual_gb)
-    end
-    
     def display_status(label)
       return display_system_status unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-      return puts "❌ VM '#{name}' not found" unless vm.exists?
+      return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
 
-      resources = vm_resources(name)
-      status = vm.status
+      status = @backend.vm_status(name)
+      cpu = @backend.vm_cpu_count(name)
+      mem_mb = @backend.vm_memory_mb(name)
 
       puts "Name:    #{name}"
       puts "Status:  #{status}"
-      puts "IP:      #{vm.ip || 'Unknown'}"
-      puts "CPU:     #{resources.split('/').first}"
-      puts "RAM:     #{resources.split('/').last}"
+      puts "IP:      #{@backend.vm_ip(name) || 'Unknown'}"
+      puts "CPU:     #{cpu || '?'}"
+      puts "RAM:     #{mem_mb ? "#{mem_mb / 1024}GB" : '?'}"
       puts "Storage: #{vm_storage(name)}"
 
-      # Live stats if running (via QEMU guest agent)
       if status.include?('started')
         live = live_stats(name)
         if live
@@ -595,10 +915,16 @@ module Kodemachine
       end
     end
 
+    def display_system_status
+      puts
+      puts "  Kodemachine v#{VERSION}"
+      puts "  Base: #{@config['base_image']} │ Shared: #{shared_disk_usage}"
+      display_list
+    end
+
     def live_stats(name)
-      # RAM: free -m
-      ram_out = `utmctl exec #{name} --cmd free -m 2>/dev/null`.strip
-      return nil if ram_out.empty?
+      ram_out = @backend.guest_exec(name, "free -m")
+      return nil unless ram_out
 
       ram_match = ram_out.match(/Mem:\s+(\d+)\s+(\d+)/)
       return nil unless ram_match
@@ -608,84 +934,114 @@ module Kodemachine
       ram_percent = [(used_mb.to_f / total_mb * 100).round, 1].max
       ram_str = format("%02d%% of %dGB", ram_percent, total_mb / 1024)
 
-      # Load average and CPU count
-      load_out = `utmctl exec #{name} --cmd cat /proc/loadavg 2>/dev/null`.strip
-      cpu_count_out = `utmctl exec #{name} --cmd nproc 2>/dev/null`.strip
+      load_out = @backend.guest_exec(name, "cat /proc/loadavg")
+      cpu_count_out = @backend.guest_exec(name, "nproc")
 
-      load_parts = load_out.split
+      load_parts = load_out&.split || []
       load_str = load_parts[0..2]&.join(", ") || "?"
 
-      # Derive CPU % from 1-min load average relative to CPU count
       cpu_str = "?"
-      if load_parts[0] && !cpu_count_out.empty?
+      if load_parts[0] && cpu_count_out && !cpu_count_out.empty?
         load_1m = load_parts[0].to_f
         cpu_count = cpu_count_out.to_i
         cpu_percent = [(load_1m / cpu_count * 100).round, 1].max
-        cpu_percent = [cpu_percent, 99].min  # Cap at 99%
+        cpu_percent = [cpu_percent, 99].min
         cpu_str = format("%02d%%", cpu_percent)
       end
 
       { ram: ram_str, cpu: cpu_str, load: load_str }
     end
 
-    def display_system_status
+    def run_doctor
+      platform = Kodemachine.detect_platform
       puts
-      puts "  Kodemachine v#{VERSION}"
-      puts "  Base: #{@config['base_image']} │ Shared: #{shared_disk_usage}"
-      display_list
+      puts "  Kodemachine v#{VERSION} — Doctor"
+      puts "  Platform: #{platform}"
+      puts
+
+      if platform == :macos
+        check("UTM installed", File.exist?("/Applications/UTM.app"))
+        check("utmctl available", system("which utmctl > /dev/null 2>&1"))
+      else
+        check("KVM available", File.exist?("/dev/kvm"))
+        check("virsh available", system("which virsh > /dev/null 2>&1"))
+        check("libvirt group", `groups 2>/dev/null`.include?('libvirt'))
+        net = `virsh -c qemu:///system net-list 2>/dev/null`
+        check("Default network active", net.include?('default') && net.include?('active'))
+      end
+
+      check("qemu-img available", system("which qemu-img > /dev/null 2>&1"))
+      check("Config exists", File.exist?(CONFIG_FILE))
+      check("Base image (#{@config['base_image']})", @backend.vm_exists?(@config['base_image']))
+
+      shared = @backend.shared_disk_path
+      check("Shared disk", shared && File.exist?(shared))
+      puts
     end
 
-    def vm_storage_total(prefix)
-      output = `du -sh #{UTM_DOCS}/#{prefix}*.utm 2>/dev/null`
-      sizes = output.scan(/^\s*([\d.]+)([KMGT]?)/).map do |num, unit|
-        num.to_f * { '' => 1, 'K' => 1024, 'M' => 1024**2, 'G' => 1024**3, 'T' => 1024**4 }[unit]
+    def check(label, ok)
+      puts "  #{ok ? '✅' : '❌'} #{label}"
+    end
+
+    def shared_disk_usage
+      shared_path = @backend.shared_disk_path
+      return "?" unless shared_path && File.exist?(shared_path)
+
+      actual = `du -sk "#{shared_path}" 2>/dev/null`.split("\t").first.to_i * 1024
+      info = `"#{@backend.qemu_img_path}" info -U "#{shared_path}" 2>/dev/null`
+      match = info.match(/virtual size:.*\((\d+) bytes\)/)
+      return "?" unless match
+
+      virtual = match[1].to_i
+      percent = [(actual.to_f / virtual * 100).round, 1].max
+      virtual_gb = (virtual.to_f / 1024**3).round
+      format("%02d%% of %dGB", percent, virtual_gb)
+    end
+
+    def vm_storage_percent(name)
+      vm_path = @backend.vm_storage_path(name)
+      return "?" unless vm_path && File.exist?(vm_path)
+
+      actual = `du -sk "#{vm_path}" 2>/dev/null`.split("\t").first.to_i * 1024
+
+      disk_files = @backend.vm_disk_files(name)
+      virtual = 0
+      disk_files.each do |f|
+        info = `"#{@backend.qemu_img_path}" info -U "#{f}" 2>/dev/null`
+        if (match = info.match(/virtual size:.*\((\d+) bytes\)/))
+          virtual += match[1].to_i
+        end
       end
-      total_bytes = sizes.sum
-      format_size(total_bytes)
+
+      return "?" if virtual == 0
+
+      percent = [(actual.to_f / virtual * 100).round, 1].max
+      virtual_gb = (virtual.to_f / 1024**3).round
+      format("%02d%% of %dGB", percent, virtual_gb)
     end
 
     def vm_storage(name)
-      output = `du -sh "#{UTM_DOCS}/#{name}.utm" 2>/dev/null`.strip
+      vm_path = @backend.vm_storage_path(name)
+      return "?" unless vm_path
+      output = `du -sh "#{vm_path}" 2>/dev/null`.strip
       output.split("\t").first || "?"
-    end
-
-    def vm_resources(name)
-      plist_path = "#{UTM_DOCS}/#{name}.utm/config.plist"
-      return "?" unless File.exist?(plist_path)
-      content = File.read(plist_path)
-
-      cpu = content.match(/<key>CPUCount<\/key>\s*<integer>(\d+)<\/integer>/)&.[](1) || "?"
-      mem_mb = content.match(/<key>MemorySize<\/key>\s*<integer>(\d+)<\/integer>/)&.[](1)
-      mem = mem_mb ? "#{mem_mb.to_i / 1024}GB" : "?"
-
-      "#{cpu}CPU/#{mem}"
-    end
-
-    def format_size(bytes)
-      return "0B" if bytes == 0
-      units = ['B', 'KB', 'MB', 'GB', 'TB']
-      exp = (Math.log(bytes) / Math.log(1024)).to_i
-      exp = units.size - 1 if exp >= units.size
-      "%.1f%s" % [bytes / (1024.0 ** exp), units[exp]]
     end
 
     def vm_stop(label)
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-      return puts "❌ VM '#{name}' not found" unless vm.exists?
+      return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
       puts "🛑 Stopping #{name}..."
-      system("utmctl stop #{name}")
+      @backend.stop_vm(name)
       puts "✅ Stopped"
     end
 
     def vm_suspend(label)
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-      return puts "❌ VM '#{name}' not found" unless vm.exists?
+      return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
       puts "⏸️  Suspending #{name}..."
-      system("utmctl suspend #{name}")
+      @backend.suspend_vm(name)
       puts "✅ Suspended"
     end
 
@@ -695,41 +1051,34 @@ module Kodemachine
         abort "❌ Cannot delete base image. Use UTM directly if you really want to remove it."
       end
       name = "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-      return puts "❌ VM '#{name}' not found" unless vm.exists?
+      return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
       puts "🗑️  Deleting #{name}..."
-      system("utmctl delete #{name}")
+      @backend.delete_vm(name)
       puts "✅ Deleted"
     end
 
     def vm_attach(label)
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
-      system("utmctl attach #{name}")
+      @backend.attach_vm(name)
     end
 
     def vm_bridge(label)
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-      return puts "❌ VM '#{name}' not found" unless vm.exists?
+      return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
 
-      status = vm.status
-      unless status.include?('stopped')
+      unless @backend.vm_status(name).include?('stopped')
         puts "❌ VM must be stopped first. Run: kodemachine stop #{label}"
         return
       end
 
-      plist_path = "#{UTM_DOCS}/#{name}.utm/config.plist"
-      content = File.read(plist_path)
-
-      if content.include?('<string>Bridged</string>')
+      if @backend.is_bridged?(name)
         puts "✅ Already using bridged networking"
         return
       end
 
-      content = @manager.set_bridged_network(content)
-      File.write(plist_path, content)
+      @backend.set_bridged_network(name)
       puts "🌐 Switched to bridged networking"
       puts "   Start with: kodemachine start #{label}"
     end
@@ -737,27 +1086,37 @@ module Kodemachine
     def vm_unbridge(label)
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
-      vm = VM.new(name)
-      return puts "❌ VM '#{name}' not found" unless vm.exists?
+      return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
 
-      status = vm.status
-      unless status.include?('stopped')
+      unless @backend.vm_status(name).include?('stopped')
         puts "❌ VM must be stopped first. Run: kodemachine stop #{label}"
         return
       end
 
-      plist_path = "#{UTM_DOCS}/#{name}.utm/config.plist"
-      content = File.read(plist_path)
-
-      unless content.include?('<string>Bridged</string>')
+      unless @backend.is_bridged?(name)
         puts "✅ Already using NAT networking"
         return
       end
 
-      content = @manager.set_nat_network(content)
-      File.write(plist_path, content)
+      @backend.set_nat_network(name)
       puts "🔒 Switched to NAT networking (isolated)"
       puts "   Start with: kodemachine start #{label}"
+    end
+
+    def file_created_time(path)
+      File.birthtime(path)
+    rescue NotImplementedError
+      File.mtime(path)
+    end
+
+    def time_ago(time)
+      seconds = (Time.now - time).to_i
+      case seconds
+      when 0..59       then "#{seconds}s ago"
+      when 60..3599    then "#{seconds / 60}m ago"
+      when 3600..86399 then "#{seconds / 3600}h ago"
+      else                  "#{seconds / 86400}d ago"
+      end
     end
   end
 end

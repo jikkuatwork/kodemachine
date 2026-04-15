@@ -3,25 +3,23 @@
 
 # Kodemachine Base Image Builder
 # Creates a golden VM image for ephemeral cloning
+# Works on macOS (UTM) and Linux (libvirt/KVM)
 
 require 'json'
 require 'fileutils'
 require 'open3'
 require 'optparse'
+require 'securerandom'
 
 module KodemachineBase
   VERSION = "1.0.0"
 
-  # Configuration
-  UTM_DOCS     = File.expand_path("~/Library/Containers/com.utmapp.UTM/Data/Documents")
   CONFIG_DIR   = File.expand_path("~/.config/kodemachine")
   CONFIG_FILE  = File.join(CONFIG_DIR, "config.json")
 
-  # Default base image settings
   DEFAULT_BASE_NAME = "kodeimage"
   DEFAULT_SSH_USER  = "kodeman"
 
-  # Packages to install
   PACKAGES = {
     core: %w[
       qemu-guest-agent
@@ -64,23 +62,35 @@ module KodemachineBase
     reset:  "\e[0m"
   }.freeze
 
+  def self.detect_platform
+    if RUBY_PLATFORM.include?('darwin')
+      :macos
+    elsif RUBY_PLATFORM.include?('linux')
+      :linux
+    else
+      abort "❌ Unsupported platform: #{RUBY_PLATFORM}"
+    end
+  end
+
+  # ── Shared builder logic ───────────────────────────────────────────────────
+
   class Builder
     def initialize(options = {})
+      @platform = KodemachineBase.detect_platform
       @options = {
-        name: nil,           # Base image name (auto-versioned)
+        name: nil,
         ssh_user: DEFAULT_SSH_USER,
-        host_ssh_key: nil,   # Path to host's public key (auto-detected if not provided)
-        dotfiles_repo: nil,  # Git repo URL
+        host_ssh_key: nil,
+        dotfiles_repo: nil,
         skip_gui: false,
         skip_browsers: false,
-        ip: nil,             # Manual IP if needed
+        ip: nil,
         verbose: false
       }.merge(options)
 
       @version = Time.now.strftime("%Y.%m")
       @base_name = @options[:name] || "#{DEFAULT_BASE_NAME}-v#{@version}"
 
-      # Auto-detect host SSH key if not provided
       @options[:host_ssh_key] ||= detect_host_ssh_key
       unless @options[:host_ssh_key]
         puts "#{COLORS[:red]}✗ No SSH key found#{COLORS[:reset]}"
@@ -113,6 +123,7 @@ module KodemachineBase
       provision_vm
       install_dotfiles if @options[:dotfiles_repo]
       inject_ssh_key if @options[:host_ssh_key]
+      enable_serial_console if @platform == :linux
       prepare_for_cloning
       finalize
 
@@ -140,34 +151,29 @@ module KodemachineBase
       BANNER
     end
 
-    def step(msg)
-      puts "#{COLORS[:blue]}==>#{COLORS[:reset]} #{msg}"
-    end
-
-    def substep(msg)
-      puts "    #{msg}"
-    end
-
-    def success(msg)
-      puts "#{COLORS[:green]}✓#{COLORS[:reset]} #{msg}"
-    end
-
-    def warn(msg)
-      puts "#{COLORS[:yellow]}!#{COLORS[:reset]} #{msg}"
-    end
-
-    def error(msg)
-      puts "#{COLORS[:red]}✗#{COLORS[:reset]} #{msg}"
-    end
+    def step(msg);    puts "#{COLORS[:blue]}==>#{COLORS[:reset]} #{msg}"; end
+    def substep(msg); puts "    #{msg}"; end
+    def success(msg); puts "#{COLORS[:green]}✓#{COLORS[:reset]} #{msg}"; end
+    def warn(msg);    puts "#{COLORS[:yellow]}!#{COLORS[:reset]} #{msg}"; end
+    def error(msg);   puts "#{COLORS[:red]}✗#{COLORS[:reset]} #{msg}"; end
 
     def verbose(msg)
       puts "#{COLORS[:gray]}  #{msg}#{COLORS[:reset]}" if @options[:verbose]
     end
 
+    # ── Prerequisites ──
+
     def check_prerequisites
       step "Checking prerequisites..."
 
-      # UTM installed?
+      if @platform == :macos
+        check_macos_prerequisites
+      else
+        check_linux_prerequisites
+      end
+    end
+
+    def check_macos_prerequisites
       unless File.exist?("/Applications/UTM.app")
         error "UTM not installed"
         puts "  Run: ./setup-host.rb"
@@ -175,7 +181,6 @@ module KodemachineBase
       end
       success "UTM installed"
 
-      # utmctl available?
       unless system("which utmctl > /dev/null 2>&1")
         error "utmctl not found"
         puts "  Ensure UTM.app includes utmctl or install separately"
@@ -184,10 +189,42 @@ module KodemachineBase
       success "utmctl available"
     end
 
+    def check_linux_prerequisites
+      unless File.exist?("/dev/kvm")
+        error "KVM not available"
+        puts "  Run: ./setup-host.rb"
+        exit 1
+      end
+      success "KVM available"
+
+      unless system("which virsh > /dev/null 2>&1")
+        error "virsh not found"
+        puts "  Run: ./setup-host.rb"
+        exit 1
+      end
+      success "virsh available"
+
+      unless `groups`.include?('libvirt')
+        error "User not in libvirt group"
+        puts "  Run: ./setup-host.rb"
+        exit 1
+      end
+      success "libvirt group OK"
+    end
+
+    # ── VM Discovery ──
+
     def get_vm_info
       step "Looking for VM to provision..."
 
-      # Check if base image already exists
+      if @platform == :macos
+        get_vm_info_macos
+      else
+        get_vm_info_linux
+      end
+    end
+
+    def get_vm_info_macos
       existing = `utmctl list 2>/dev/null`.split("\n").find { |l| l.include?(@base_name) }
 
       if existing
@@ -200,37 +237,16 @@ module KodemachineBase
           sleep 3
         end
       else
-        # Look for any VM with 'ubuntu' in the name that's not already a kodeimage
         ubuntu_vms = `utmctl list 2>/dev/null`.split("\n")
           .select { |l| l.downcase.include?('ubuntu') && !l.include?('kodeimage') }
 
         if ubuntu_vms.empty?
-          puts
-          error "No suitable VM found"
-          puts
-          puts "Please create a fresh Ubuntu VM first:"
-          puts
-          puts "  1. Download Ubuntu 24.04 ARM64:"
-          puts "     https://ubuntu.com/download/server/arm"
-          puts
-          puts "  2. Create VM in UTM:"
-          puts "     - Name: ubuntu-base (or similar)"
-          puts "     - RAM: 4-8GB"
-          puts "     - Disk: 32-64GB"
-          puts
-          puts "  3. Install Ubuntu, then run this script again"
-          puts
+          no_vm_found_message("UTM")
           exit 1
         end
 
         vm_name = ubuntu_vms.first.split(/\s+/)[2]
-        puts
-        puts "Found: #{vm_name}"
-        puts "This VM will be provisioned and renamed to: #{@base_name}"
-        puts
-        print "Continue? [y/N] "
-        response = $stdin.gets.strip.downcase
-        exit 0 unless response == 'y'
+        confirm_provision(vm_name)
 
         @source_vm = vm_name
         status = ubuntu_vms.first.split(/\s+/)[1]
@@ -244,15 +260,92 @@ module KodemachineBase
       @vm_name = @source_vm || @base_name
     end
 
+    def get_vm_info_linux
+      virsh_uri = "qemu:///system"
+      all_vms = `virsh -c #{virsh_uri} list --all 2>/dev/null`
+
+      existing = all_vms.split("\n").find { |l| l.include?(@base_name) }
+
+      if existing
+        state = existing.strip.split(/\s+/, 3)[2]
+        if state == 'running'
+          success "Found running: #{@base_name}"
+        else
+          warn "Found stopped: #{@base_name}. Starting..."
+          system("virsh", "-c", virsh_uri, "start", @base_name)
+          sleep 3
+        end
+      else
+        ubuntu_vms = all_vms.split("\n").select do |l|
+          stripped = l.strip
+          next false if stripped.empty? || stripped.start_with?('Id') || stripped.start_with?('-')
+          stripped.downcase.include?('ubuntu') && !stripped.include?('kodeimage')
+        end
+
+        if ubuntu_vms.empty?
+          no_vm_found_message("virt-manager or virt-install")
+          exit 1
+        end
+
+        vm_name = ubuntu_vms.first.strip.split(/\s+/, 3)[1]
+        confirm_provision(vm_name)
+
+        @source_vm = vm_name
+        state = ubuntu_vms.first.strip.split(/\s+/, 3)[2]
+        unless state == 'running'
+          step "Starting #{vm_name}..."
+          system("virsh", "-c", virsh_uri, "start", vm_name)
+          sleep 3
+        end
+      end
+
+      @vm_name = @source_vm || @base_name
+    end
+
+    def no_vm_found_message(tool)
+      puts
+      error "No suitable VM found"
+      puts
+      puts "Please create a fresh Ubuntu VM first:"
+      puts
+      if @platform == :macos
+        puts "  1. Download Ubuntu 24.04 ARM64:"
+        puts "     https://ubuntu.com/download/server/arm"
+        puts
+        puts "  2. Create VM in UTM:"
+      else
+        puts "  1. Download Ubuntu 24.04 (x86_64):"
+        puts "     https://ubuntu.com/download/server"
+        puts
+        puts "  2. Create VM in virt-manager (or virt-install):"
+      end
+      puts "     - Name: ubuntu-base (or similar)"
+      puts "     - RAM: 4-8GB"
+      puts "     - Disk: 32-64GB"
+      puts
+      puts "  3. Install Ubuntu, then run this script again"
+      puts
+    end
+
+    def confirm_provision(vm_name)
+      puts
+      puts "Found: #{vm_name}"
+      puts "This VM will be provisioned and renamed to: #{@base_name}"
+      puts
+      print "Continue? [y/N] "
+      response = $stdin.gets.strip.downcase
+      exit 0 unless response == 'y'
+    end
+
+    # ── SSH ──
+
     def wait_for_ssh
       step "Waiting for SSH..."
-
       @ip = @options[:ip]
 
       unless @ip
-        30.times do |i|
-          output = `utmctl ip-address #{@vm_name} 2>/dev/null`
-          @ip = output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)&.[](1)
+        30.times do
+          @ip = detect_ip
           break if @ip
           print "."
           $stdout.flush
@@ -263,7 +356,11 @@ module KodemachineBase
 
       unless @ip
         error "Could not get IP address"
-        puts "  Try: utmctl attach #{@vm_name}"
+        if @platform == :macos
+          puts "  Try: utmctl attach #{@vm_name}"
+        else
+          puts "  Try: virsh -c qemu:///system console #{@vm_name}"
+        end
         puts "  Then run: ip addr show"
         puts "  And re-run with: --ip <address>"
         exit 1
@@ -271,7 +368,6 @@ module KodemachineBase
 
       success "IP: #{@ip}"
 
-      # Wait for SSH to be ready
       step "Waiting for SSH to accept connections..."
       ssh_ready = false
       20.times do
@@ -291,6 +387,18 @@ module KodemachineBase
       end
 
       success "SSH ready"
+    end
+
+    def detect_ip
+      if @platform == :macos
+        output = `utmctl ip-address #{@vm_name} 2>/dev/null`
+      else
+        output = `virsh -c qemu:///system domifaddr #{@vm_name} --source agent 2>/dev/null`
+        if output.empty? || !output.match?(/\d{1,3}\.\d{1,3}/)
+          output = `virsh -c qemu:///system domifaddr #{@vm_name} --source lease 2>/dev/null`
+        end
+      end
+      output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)&.[](1)
     end
 
     def ssh_exec(cmd, sudo: false)
@@ -318,41 +426,35 @@ module KodemachineBase
       true
     end
 
+    # ── Provisioning ──
+
     def provision_vm
       step "Provisioning VM..."
 
-      # Update package lists
       substep "Updating package lists..."
       ssh_exec("apt update", sudo: true)
 
-      # Upgrade existing packages
       substep "Upgrading packages..."
       ssh_exec("DEBIAN_FRONTEND=noninteractive apt upgrade -y", sudo: true)
 
-      # Install core packages
       substep "Installing core packages..."
       ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:core].join(' ')}", sudo: true)
 
-      # Enable qemu-guest-agent
       ssh_exec("systemctl enable --now qemu-guest-agent", sudo: true)
 
-      # Install GUI unless skipped
       unless @options[:skip_gui]
         substep "Installing GUI (XFCE)..."
         ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:gui].join(' ')}", sudo: true)
       end
 
-      # Install browsers unless skipped
       unless @options[:skip_browsers]
         substep "Installing browsers..."
         ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:browsers].join(' ')}", sudo: true)
       end
 
-      # Install fonts
       substep "Installing fonts..."
       ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:fonts].join(' ')}", sudo: true)
 
-      # Install Nerd Font
       substep "Installing Nerd Font (CaskaydiaCove)..."
       nerd_font_cmd = <<~CMD.gsub("\n", " && ")
         mkdir -p ~/.local/share/fonts
@@ -364,16 +466,13 @@ module KodemachineBase
       CMD
       ssh_exec(nerd_font_cmd)
 
-      # Install tools
       substep "Installing tools..."
       ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:tools].join(' ')}", sudo: true)
 
-      # Set zsh as default shell
       substep "Setting zsh as default shell..."
       ssh_exec("apt install -y zsh", sudo: true)
       ssh_exec("chsh -s /bin/zsh #{@options[:ssh_user]}", sudo: true)
 
-      # Clean up
       substep "Cleaning up..."
       ssh_exec("apt autoremove -y && apt clean", sudo: true)
 
@@ -382,14 +481,11 @@ module KodemachineBase
 
     def install_dotfiles
       step "Installing dotfiles..."
-
       repo = @options[:dotfiles_repo]
 
-      # Clone dotfiles
       substep "Cloning #{repo}..."
       ssh_exec("git clone #{repo} ~/dotfiles")
 
-      # Run bootstrap.sh if it exists
       substep "Looking for bootstrap.sh..."
       ssh_exec("cd ~/dotfiles && test -f bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh start || echo 'No bootstrap.sh found, skipping'")
 
@@ -398,7 +494,6 @@ module KodemachineBase
 
     def inject_ssh_key
       step "Injecting host SSH key..."
-
       key_path = @options[:host_ssh_key]
       unless File.exist?(key_path)
         error "SSH key not found: #{key_path}"
@@ -415,18 +510,28 @@ module KodemachineBase
       success "Host SSH key injected"
     end
 
+    def enable_serial_console
+      step "Enabling serial console (for virsh console access)..."
+
+      substep "Configuring GRUB for serial output..."
+      ssh_exec("sed -i 's/^GRUB_CMDLINE_LINUX=\"\"/GRUB_CMDLINE_LINUX=\"console=tty0 console=ttyS0,115200\"/' /etc/default/grub", sudo: true)
+      ssh_exec("update-grub", sudo: true)
+
+      substep "Enabling serial getty..."
+      ssh_exec("systemctl enable serial-getty@ttyS0.service", sudo: true)
+
+      success "Serial console enabled"
+    end
+
     def prepare_for_cloning
       step "Preparing for cloning..."
 
-      # Truncate machine-id so each clone gets unique ID
       substep "Truncating machine-id..."
       ssh_exec("truncate -s 0 /etc/machine-id", sudo: true)
 
-      # Clear SSH host keys (regenerate on first boot of each clone)
       substep "Clearing SSH host keys..."
       ssh_exec("rm -f /etc/ssh/ssh_host_*", sudo: true)
 
-      # Clear bash history
       substep "Clearing history..."
       ssh_exec("cat /dev/null > ~/.bash_history")
       ssh_exec("cat /dev/null > ~/.zsh_history 2>/dev/null || true")
@@ -434,54 +539,114 @@ module KodemachineBase
       success "Ready for cloning"
     end
 
+    # ── Finalize ──
+
     def finalize
       step "Finalizing..."
 
-      # Shutdown the VM
       substep "Shutting down VM..."
       ssh_exec("shutdown -h now", sudo: true)
 
       # Wait for shutdown
       10.times do
-        status = `utmctl status #{@vm_name} 2>/dev/null`.strip.downcase
-        break if status.include?('stopped')
+        if @platform == :macos
+          status = `utmctl status #{@vm_name} 2>/dev/null`.strip.downcase
+          break if status.include?('stopped')
+        else
+          status = `virsh -c qemu:///system domstate #{@vm_name} 2>/dev/null`.strip
+          break if status == 'shut off'
+        end
         sleep 2
       end
 
-      # Rename VM if it was a source VM
+      # Rename if source VM differs from target name
       if @source_vm && @source_vm != @base_name
-        substep "Renaming #{@source_vm} -> #{@base_name}..."
-
-        source_path = "#{UTM_DOCS}/#{@source_vm}.utm"
-        target_path = "#{UTM_DOCS}/#{@base_name}.utm"
-
-        if File.exist?(source_path)
-          # Delete from UTM first
-          system("utmctl delete #{@source_vm} 2>/dev/null")
-          sleep 1
-
-          # Rename on disk
-          FileUtils.mv(source_path, target_path)
-
-          # Update plist
-          plist = "#{target_path}/config.plist"
-          if File.exist?(plist)
-            content = File.read(plist)
-            content.gsub!(/<key>Name<\/key>\s*<string>[^<]+<\/string>/,
-                          "<key>Name</key>\n\t\t<string>#{@base_name}</string>")
-            File.write(plist, content)
-          end
-
-          # Re-register with UTM
-          system("open -a UTM '#{target_path}'")
-          sleep 2
+        if @platform == :macos
+          finalize_rename_macos
+        else
+          finalize_rename_linux
         end
       end
 
-      # Update config file
       update_config
-
       success "Base image ready: #{@base_name}"
+    end
+
+    def finalize_rename_macos
+      utm_docs = File.expand_path("~/Library/Containers/com.utmapp.UTM/Data/Documents")
+      source_path = "#{utm_docs}/#{@source_vm}.utm"
+      target_path = "#{utm_docs}/#{@base_name}.utm"
+
+      substep "Renaming #{@source_vm} -> #{@base_name}..."
+
+      if File.exist?(source_path)
+        system("utmctl delete #{@source_vm} 2>/dev/null")
+        sleep 1
+
+        FileUtils.mv(source_path, target_path)
+
+        plist = "#{target_path}/config.plist"
+        if File.exist?(plist)
+          content = File.read(plist)
+          content.gsub!(/<key>Name<\/key>\s*<string>[^<]+<\/string>/,
+                        "<key>Name</key>\n\t\t<string>#{@base_name}</string>")
+          File.write(plist, content)
+        end
+
+        system("open -a UTM '#{target_path}'")
+        sleep 2
+      end
+    end
+
+    def finalize_rename_linux
+      require 'rexml/document'
+      require 'tempfile'
+
+      virsh_uri = "qemu:///system"
+
+      substep "Renaming #{@source_vm} -> #{@base_name}..."
+
+      # Dump current XML
+      xml = `virsh -c #{virsh_uri} dumpxml #{@source_vm} 2>/dev/null`
+      return if xml.empty?
+
+      doc = REXML::Document.new(xml)
+
+      # Get disk path for renaming
+      old_disk = nil
+      doc.elements.each('domain/devices/disk') do |disk|
+        target = disk.elements['target']
+        next unless target && target.attributes['dev'] == 'vda'
+        source = disk.elements['source']
+        old_disk = source.attributes['file'] if source
+      end
+
+      # Undefine old domain
+      system("virsh", "-c", virsh_uri, "undefine", @source_vm)
+
+      # Rename disk file if it contains the old name
+      if old_disk && File.exist?(old_disk)
+        new_disk = old_disk.sub(@source_vm, @base_name)
+        if new_disk != old_disk
+          FileUtils.mv(old_disk, new_disk)
+          # Update disk path in XML
+          doc.elements.each('domain/devices/disk') do |disk|
+            source = disk.elements['source']
+            source.attributes['file'] = new_disk if source && source.attributes['file'] == old_disk
+          end
+        end
+      end
+
+      # Update name and UUID
+      doc.elements['domain/name'].text = @base_name
+      doc.elements['domain/uuid'].text = SecureRandom.uuid
+
+      # Redefine with new name
+      tmp = Tempfile.new(['km-base-', '.xml'])
+      doc.write(tmp)
+      tmp.close
+      system("virsh", "-c", virsh_uri, "define", tmp.path)
+      tmp.unlink
     end
 
     def update_config
@@ -502,6 +667,8 @@ module KodemachineBase
       success "Updated config: #{CONFIG_FILE}"
     end
   end
+
+  # ── CLI ────────────────────────────────────────────────────────────────────
 
   class CLI
     def self.run(args)
