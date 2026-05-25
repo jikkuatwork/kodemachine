@@ -1,4 +1,4 @@
-#!/usr/bin/ruby
+#!/usr/bin/env ruby
 # frozen_string_literal: true
 
 # Kodemachine Base Image Builder
@@ -10,6 +10,7 @@ require 'fileutils'
 require 'open3'
 require 'optparse'
 require 'securerandom'
+require 'shellwords'
 
 module KodemachineBase
   VERSION = "1.0.0"
@@ -42,6 +43,7 @@ module KodemachineBase
     fonts: %w[
       fonts-noto
       fonts-liberation
+      fontconfig
     ],
     tools: %w[
       htop
@@ -50,6 +52,12 @@ module KodemachineBase
       jq
       unzip
       xclip
+    ],
+    containers: %w[
+      podman
+      uidmap
+      fuse-overlayfs
+      slirp4netns
     ]
   }.freeze
 
@@ -123,7 +131,10 @@ module KodemachineBase
       provision_vm
       install_dotfiles if @options[:dotfiles_repo]
       inject_ssh_key if @options[:host_ssh_key]
-      enable_serial_console if @platform == :linux
+      if @platform == :linux
+        enable_serial_console
+        configure_linux_guest
+      end
       prepare_for_cloning
       finalize
 
@@ -278,7 +289,7 @@ module KodemachineBase
       else
         ubuntu_vms = all_vms.split("\n").select do |l|
           stripped = l.strip
-          next false if stripped.empty? || stripped.start_with?('Id') || stripped.start_with?('-')
+          next false if stripped.empty? || stripped.start_with?('Id') || stripped.match?(/\A-+\z/)
           stripped.downcase.include?('ubuntu') && !stripped.include?('kodeimage')
         end
 
@@ -392,17 +403,25 @@ module KodemachineBase
     def detect_ip
       if @platform == :macos
         output = `utmctl ip-address #{@vm_name} 2>/dev/null`
+        extract_ipv4(output)
       else
         output = `virsh -c qemu:///system domifaddr #{@vm_name} --source agent 2>/dev/null`
-        if output.empty? || !output.match?(/\d{1,3}\.\d{1,3}/)
-          output = `virsh -c qemu:///system domifaddr #{@vm_name} --source lease 2>/dev/null`
-        end
+        ip = extract_ipv4(output)
+        return ip if ip
+
+        output = `virsh -c qemu:///system domifaddr #{@vm_name} --source lease 2>/dev/null`
+        extract_ipv4(output)
       end
-      output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)&.[](1)
+    end
+
+    def extract_ipv4(output)
+      output.scan(/\b(?:\d{1,3}\.){3}\d{1,3}\b/).find do |ip|
+        !ip.start_with?('127.') && ip != '0.0.0.0'
+      end
     end
 
     def ssh_exec(cmd, sudo: false)
-      full_cmd = sudo ? "sudo #{cmd}" : cmd
+      full_cmd = sudo ? "sudo sh -c #{Shellwords.escape(cmd)}" : cmd
       verbose "SSH: #{full_cmd}"
 
       ssh_cmd = [
@@ -456,18 +475,23 @@ module KodemachineBase
       ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:fonts].join(' ')}", sudo: true)
 
       substep "Installing Nerd Font (CaskaydiaCove)..."
-      nerd_font_cmd = <<~CMD.gsub("\n", " && ")
-        mkdir -p ~/.local/share/fonts
-        cd /tmp
-        curl -fsSL -o nerd-font.zip https://github.com/ryanoasis/nerd-fonts/releases/latest/download/CascadiaCode.zip
-        unzip -o nerd-font.zip -d ~/.local/share/fonts '*.ttf'
-        fc-cache -fv
-        rm nerd-font.zip
-      CMD
+      nerd_font_cmd = [
+        "mkdir -p ~/.local/share/fonts",
+        "cd /tmp",
+        "curl -fsSL -o nerd-font.zip https://github.com/ryanoasis/nerd-fonts/releases/latest/download/CascadiaCode.zip",
+        "unzip -o nerd-font.zip -d ~/.local/share/fonts '*.ttf'",
+        "fc-cache -fv",
+        "rm nerd-font.zip"
+      ].join(" && ")
       ssh_exec(nerd_font_cmd)
 
       substep "Installing tools..."
       ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:tools].join(' ')}", sudo: true)
+
+      substep "Installing container runtime (Podman, no Docker daemon)..."
+      ssh_exec("DEBIAN_FRONTEND=noninteractive apt install -y #{PACKAGES[:containers].join(' ')}", sudo: true)
+      ssh_exec("grep -q '^#{@options[:ssh_user]}:' /etc/subuid || usermod --add-subuids 100000-165535 #{@options[:ssh_user]}", sudo: true)
+      ssh_exec("grep -q '^#{@options[:ssh_user]}:' /etc/subgid || usermod --add-subgids 100000-165535 #{@options[:ssh_user]}", sudo: true)
 
       substep "Setting zsh as default shell..."
       ssh_exec("apt install -y zsh", sudo: true)
@@ -523,14 +547,49 @@ module KodemachineBase
       success "Serial console enabled"
     end
 
+    def configure_linux_guest
+      step "Configuring Linux guest for cloning..."
+
+      substep "Configuring MAC-independent DHCP..."
+      netplan_cmd = <<~CMD
+        rm -f /etc/netplan/50-cloud-init.yaml /etc/netplan/50-curtin-networking.yaml
+        cat > /etc/netplan/01-kodemachine.yaml <<'EOF'
+        network:
+          version: 2
+          ethernets:
+            default:
+              match:
+                name: "en*"
+              dhcp4: true
+              dhcp6: true
+        EOF
+        chmod 600 /etc/netplan/01-kodemachine.yaml
+        netplan generate
+      CMD
+      ssh_exec(netplan_cmd, sudo: true)
+
+      substep "Ensuring SSH host keys regenerate on clone boot..."
+      hostkeys_cmd = <<~CMD
+        mkdir -p /etc/systemd/system/ssh.service.d
+        cat > /etc/systemd/system/ssh.service.d/10-kodemachine-hostkeys.conf <<'EOF'
+        [Service]
+        ExecStartPre=
+        ExecStartPre=/usr/bin/ssh-keygen -A
+        ExecStartPre=/usr/sbin/sshd -t
+        EOF
+        systemctl daemon-reload
+        systemctl enable ssh
+      CMD
+      ssh_exec(hostkeys_cmd, sudo: true)
+
+      success "Linux guest clone settings applied"
+    end
+
     def prepare_for_cloning
       step "Preparing for cloning..."
 
       substep "Truncating machine-id..."
       ssh_exec("truncate -s 0 /etc/machine-id", sudo: true)
-
-      substep "Clearing SSH host keys..."
-      ssh_exec("rm -f /etc/ssh/ssh_host_*", sudo: true)
 
       substep "Clearing history..."
       ssh_exec("cat /dev/null > ~/.bash_history")
@@ -544,8 +603,8 @@ module KodemachineBase
     def finalize
       step "Finalizing..."
 
-      substep "Shutting down VM..."
-      ssh_exec("shutdown -h now", sudo: true)
+      substep "Clearing SSH host keys and shutting down VM..."
+      ssh_exec("rm -f /etc/ssh/ssh_host_* && shutdown -h now", sudo: true)
 
       # Wait for shutdown
       10.times do
@@ -612,14 +671,19 @@ module KodemachineBase
 
       doc = REXML::Document.new(xml)
 
-      # Get disk path for renaming
+      # Get disk path for renaming and remove install/cloud-init media.
       old_disk = nil
+      disks_to_remove = []
       doc.elements.each('domain/devices/disk') do |disk|
         target = disk.elements['target']
-        next unless target && target.attributes['dev'] == 'vda'
-        source = disk.elements['source']
-        old_disk = source.attributes['file'] if source
+        if target && target.attributes['dev'] == 'vda'
+          source = disk.elements['source']
+          old_disk = source.attributes['file'] if source
+        else
+          disks_to_remove << disk
+        end
       end
+      disks_to_remove.each { |disk| disk.parent.delete_element(disk) }
 
       # Undefine old domain
       system("virsh", "-c", virsh_uri, "undefine", @source_vm)
@@ -662,6 +726,8 @@ module KodemachineBase
       config['ssh_user'] ||= @options[:ssh_user]
       config['prefix'] ||= 'km-'
       config['headless'] = true if config['headless'].nil?
+      config['shared_disk'] ||= 'Shared/projects-luks.qcow2'
+      config['images_dir'] ||= '~/.local/share/kodemachine/images' if @platform == :linux
 
       File.write(CONFIG_FILE, JSON.pretty_generate(config))
       success "Updated config: #{CONFIG_FILE}"

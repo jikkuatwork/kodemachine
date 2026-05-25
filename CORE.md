@@ -16,7 +16,7 @@ Modern development often leads to "configuration drift," where local environment
 
 ### Language: Pure Ruby
 
-Chosen for its presence on macOS (`/usr/bin/ruby`) and Linux (system Ruby). By avoiding external Gems and version managers (like `asdf`), the tool achieves **zero-dependency portability**. It utilizes the standard library's `OptionParser`, `JSON`, `FileUtils`, `REXML`, and `SecureRandom`.
+Chosen for its availability on macOS and Linux without external gems. Scripts use `#!/usr/bin/env ruby` so they work with system Ruby, Homebrew Ruby, mise, rbenv, or any other Ruby that is on `PATH`; no version manager is required. The implementation stays in the standard library: `OptionParser`, `JSON`, `FileUtils`, `REXML`, and `SecureRandom`.
 
 ### Multi-Platform: Backend Abstraction
 
@@ -62,7 +62,7 @@ The system is built on a four-tier Object-Oriented model:
 
 ### Image Baking
 
-1. Install **Ubuntu 24.04 LTS** (ARM64 on macOS, x86_64 on Linux).
+1. Install **Ubuntu 24.04 LTS** using the host-native architecture (ARM64 on Apple Silicon macOS, x86_64/amd64 on x86_64 Linux). Avoid ARM64 guests on x86_64 hosts unless you explicitly want slow CPU emulation.
 2. Install `qemu-guest-agent` and enable the service.
 3. Configure SSH with your public key.
 4. **Crucial:** Truncate `/etc/machine-id` so clones generate unique D-Bus/DHCP IDs.
@@ -93,7 +93,7 @@ Communication between the CLI (`utmctl`) and the UTM background process occurs v
 
 ### Linux: libvirt/virsh
 
-Communication uses the `virsh` CLI against `qemu:///system`. Errors are generally deterministic (e.g., domain not found, permission denied). The libvirt group membership and storage pool setup (via `setup-host.rb`) prevent most common permission issues.
+Communication uses the `virsh` CLI against `qemu:///system`. Errors are generally deterministic (e.g., domain not found, permission denied). The libvirt group membership, storage pool setup, and storage ACLs (via `setup-host.rb`) prevent most common permission issues.
 
 ---
 

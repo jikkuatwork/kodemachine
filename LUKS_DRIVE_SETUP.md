@@ -24,7 +24,7 @@ kodemachine setup-luks
 
 ```bash
 lsblk | grep vdb
-# Should show: vdb  253:16  0  10G  0  disk
+# Should show: vdb  ...  disk (64G by default on Linux, or your configured size)
 ```
 
 ### 3. Format with LUKS
@@ -155,7 +155,8 @@ fi
 
 | Item | Path |
 |------|------|
-| Shared disk (host) | `~/Library/.../UTM/Data/Documents/Shared/` |
+| Shared disk (host, macOS) | `~/Library/.../UTM/Data/Documents/Shared/` |
+| Shared disk (host, Linux) | `~/.local/share/kodemachine/images/Shared/` by default |
 | Mount point (VM) | `/mnt/projects` |
 | Device (VM) | `/dev/vdb` |
 | Mapper (VM) | `/dev/mapper/projects` |

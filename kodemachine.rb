@@ -1,4 +1,4 @@
-#!/usr/bin/ruby
+#!/usr/bin/env ruby
 # frozen_string_literal: true
 
 require 'json'
@@ -141,6 +141,7 @@ module Kodemachine
     def shared_disk_path
       sd = @config['shared_disk']
       return nil unless sd
+      return File.expand_path(sd) if sd.start_with?('/', '~')
       "#{UTM_DOCS}/#{sd}"
     end
 
@@ -267,7 +268,7 @@ module Kodemachine
     def initialize(config)
       require 'rexml/document'
       @config = config
-      @images_dir = File.expand_path("~/.local/share/kodemachine/images")
+      @images_dir = File.expand_path(config['images_dir'] || "~/.local/share/kodemachine/images")
     end
 
     def images_dir;    @images_dir; end
@@ -276,7 +277,7 @@ module Kodemachine
     def list_vms
       `virsh -c #{VIRSH_URI} list --all 2>/dev/null`.split("\n").map do |line|
         line = line.strip
-        next if line.empty? || line.start_with?('Id') || line.start_with?('-')
+        next if line.empty? || line.start_with?('Id') || line.match?(/\A-+\z/)
         parts = line.split(/\s+/, 3)
         next unless parts.size >= 3
         { name: parts[1], status: normalize_status(parts[2]) }
@@ -292,14 +293,14 @@ module Kodemachine
     end
 
     def vm_ip(name)
-      # Try guest agent first, then DHCP leases
+      # Try guest agent first, then DHCP leases. The guest agent output includes
+      # loopback addresses, so never return 127.x.x.x.
       output = `virsh -c #{VIRSH_URI} domifaddr #{name} --source agent 2>/dev/null`
-      match = output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
-      return match[1] if match
+      ip = extract_ipv4(output)
+      return ip if ip
 
       output = `virsh -c #{VIRSH_URI} domifaddr #{name} --source lease 2>/dev/null`
-      match = output.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
-      match&.[](1)
+      extract_ipv4(output)
     end
 
     def start_vm(name, headless: true)
@@ -388,6 +389,7 @@ module Kodemachine
     def shared_disk_path
       sd = @config['shared_disk']
       return nil unless sd
+      return File.expand_path(sd) if sd.start_with?('/', '~')
       File.join(@images_dir, sd)
     end
 
@@ -427,6 +429,11 @@ module Kodemachine
         if target && target.attributes['dev'] == 'vda'
           source = disk.elements['source']
           source.attributes['file'] = clone_disk if source
+          remove_child_elements(disk, 'backingStore')
+          backing = disk.add_element('backingStore', 'type' => 'file')
+          backing.add_element('format', 'type' => 'qcow2')
+          backing.add_element('source', 'file' => base_disk)
+          backing.add_element('backingStore')
         else
           disks_to_remove << disk
         end
@@ -495,6 +502,12 @@ module Kodemachine
 
     private
 
+    def extract_ipv4(output)
+      output.scan(/\b(?:\d{1,3}\.){3}\d{1,3}\b/).find do |ip|
+        !ip.start_with?('127.') && ip != '0.0.0.0'
+      end
+    end
+
     def normalize_status(status)
       case status
       when "running"  then "started"
@@ -537,12 +550,17 @@ module Kodemachine
       bridges.first.split(/\s+/).first
     end
 
+    def remove_child_elements(parent, name)
+      while (el = parent.elements[name])
+        parent.delete_element(el)
+      end
+    end
+
     def add_shared_disk_xml(devices, path)
       disk = devices.add_element('disk', 'type' => 'file', 'device' => 'disk')
       disk.add_element('driver', 'name' => 'qemu', 'type' => 'qcow2')
       disk.add_element('source', 'file' => path)
       disk.add_element('target', 'dev' => 'vdb', 'bus' => 'virtio')
-      disk.add_element('shareable')
     end
 
     def remove_xml_elements(doc, xpath)
@@ -555,8 +573,10 @@ module Kodemachine
       tmp = Tempfile.new(['km-', '.xml'])
       doc.write(tmp)
       tmp.close
-      system("virsh", "-c", VIRSH_URI, "define", tmp.path)
+      ok = system("virsh", "-c", VIRSH_URI, "define", tmp.path)
       tmp.unlink
+      abort "❌ Failed to define libvirt domain" unless ok
+      true
     end
   end
 
@@ -755,27 +775,43 @@ module Kodemachine
     def spawn(label)
       vm = @manager.ensure_running(label, gui: @options[:gui], attach_disk: !@options[:no_disk], isolated: @options[:isolated])
 
-      ip = @backend.vm_ip(vm.name)
-
-      unless ip
-        puts "🔍 Waiting for IP..."
-        30.times do
-          ip = @backend.vm_ip(vm.name)
-          break if ip
-          print "."
-          $stdout.flush
-          sleep 2
-        end
-        puts ""
-      end
+      ip = wait_for_ip_and_ssh(vm.name)
 
       if ip
+        puts ""
         puts "✅ Ready: #{ip}"
         @backend.inject_hostname(vm.name)
         exec "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null #{@config['ssh_user']}@#{ip}"
       else
-        puts "❌ IP Timeout. Check VM state or try: kodemachine attach #{label || vm.name}"
+        puts ""
+        puts "❌ IP/SSH Timeout. Check VM state or try: kodemachine attach #{label || vm.name}"
       end
+    end
+
+    def wait_for_ip_and_ssh(name)
+      last_ip = nil
+      print "🔍 Waiting for IP/SSH"
+
+      60.times do
+        ip = @backend.vm_ip(name)
+        if ip
+          if ip != last_ip
+            print " #{ip}"
+            last_ip = ip
+          end
+          return ip if ssh_port_open?(ip)
+        end
+
+        print "."
+        $stdout.flush
+        sleep 2
+      end
+
+      nil
+    end
+
+    def ssh_port_open?(ip)
+      system("nc", "-z", "-w", "1", ip, "22", out: File::NULL, err: File::NULL)
     end
 
     def display_list
@@ -968,6 +1004,8 @@ module Kodemachine
         check("libvirt group", `groups 2>/dev/null`.include?('libvirt'))
         net = `virsh -c qemu:///system net-list 2>/dev/null`
         check("Default network active", net.include?('default') && net.include?('active'))
+        pools = `virsh -c qemu:///system pool-list --all 2>/dev/null`
+        check("kodemachine storage pool active", pools.include?('kodemachine') && pools.include?('active'))
       end
 
       check("qemu-img available", system("which qemu-img > /dev/null 2>&1"))
@@ -1048,7 +1086,7 @@ module Kodemachine
     def vm_delete(label)
       return puts "Provide a label" unless label
       if label == 'base'
-        abort "❌ Cannot delete base image. Use UTM directly if you really want to remove it."
+        abort "❌ Cannot delete base image. Use your hypervisor directly if you really want to remove it."
       end
       name = "#{@config['prefix']}#{label}"
       return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)

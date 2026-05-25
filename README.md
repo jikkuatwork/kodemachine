@@ -69,20 +69,29 @@ kodemachine start myproject
 ### Linux
 
 ```bash
-# 1. Setup host (once — installs libvirt, creates storage pool)
+# 1. Setup host (once — checks libvirt/KVM, creates storage pool)
 ./setup-host.rb
 
 # 2. Create a base Ubuntu VM in virt-manager (or virt-install)
-#    Name it "ubuntu-base", install Ubuntu, enable SSH
+#    Name it "ubuntu-base", use the host-native architecture,
+#    create user "kodeman", and enable OpenSSH during install.
+#    On x86_64 Linux, use the amd64 ISO/image (not ARM64 emulation).
 
 # 3. Provision the base image
-./create-base.rb
+#    For AI-agent/container workloads, headless is usually enough:
+./create-base.rb --skip-gui --skip-browsers
 
 # 4. Daily workflow
 kodemachine start myproject
 ```
 
 ## Architecture
+
+Kodemachine uses the host's native CPU architecture for VMs: ARM64 on Apple
+Silicon Macs, x86_64/amd64 on x86_64 Linux hosts. This keeps virtualization
+near-native. Running ARM64 guests on an x86_64 Linux host requires CPU emulation
+and is usually far too slow for compilers, browsers, package managers, and AI
+agent tooling.
 
 ```
 ┌───────────────────────────────────────────────────────────┐
@@ -134,7 +143,9 @@ Run once on a new machine:
 - Check KVM, libvirt, virsh, qemu-img
 - Ensure user is in `libvirt` group
 - Activate default NAT network
-- Create `kodemachine` libvirt storage pool (~/.local/share/kodemachine/images/)
+- Create `kodemachine` libvirt storage pool (`~/.local/share/kodemachine/images/`)
+- Create sparse shared disk (`Shared/projects-luks.qcow2`, 64GB by default on Linux)
+- Apply ACLs so the libvirt QEMU user can access the user-owned storage pool
 - Create config directory
 - Setup `kodemachine` command symlink
 
@@ -175,6 +186,7 @@ Run every ~6 months (or when you want a fresh golden image):
 | Browsers | Firefox, Chromium |
 | Fonts | Noto, Liberation, CaskaydiaCove Nerd Font |
 | Tools | htop, btop, tree, jq, xclip |
+| Containers | Podman, uidmap, fuse-overlayfs, slirp4netns |
 | Shell | zsh (set as default) |
 
 ## Daily Commands
@@ -235,17 +247,19 @@ Location: `~/.config/kodemachine/config.json`
   "ssh_user": "kodeman",
   "prefix": "km-",
   "headless": true,
-  "shared_disk": "Shared/projects-luks.qcow2"
+  "shared_disk": "Shared/projects-luks.qcow2",
+  "images_dir": "~/.local/share/kodemachine/images"
 }
 ```
 
 | Key | Description |
 |-----|-------------|
-| `base_image` | Golden image name in UTM |
+| `base_image` | Golden image name in UTM/libvirt |
 | `ssh_user` | SSH username |
 | `prefix` | Clone name prefix |
 | `headless` | Hide VM window |
-| `shared_disk` | Shared disk path (relative to UTM docs) |
+| `shared_disk` | Shared disk path (relative to UTM docs on macOS, or `images_dir` on Linux) |
+| `images_dir` | Linux-only VM image directory (default: `~/.local/share/kodemachine/images`) |
 
 ## Shared LUKS Disk
 
