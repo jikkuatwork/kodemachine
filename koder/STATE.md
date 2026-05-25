@@ -13,6 +13,7 @@
    - Fixed libvirt qcow2 backing-chain XML so clones actually boot from the base backing file
    - Linux shared disk no longer uses `<shareable>` for qcow2 (libvirt rejects that)
    - `start` now polls IP and SSH together, so stale libvirt DHCP leases do not cause SSH timeout
+   - Starting clones is blocked while `base` is running; clones use the base qcow2 as backing storage and require the base to be shut off
 
 2. **setup-host.rb** — Split into `MacosSetup` and `LinuxSetup`
    - Linux: checks KVM, libvirt, virsh, qemu-img, ACL tools, group membership, default network
@@ -68,6 +69,7 @@
 4. Smoke tests passed:
    - `kodemachine start smoke --no-disk`
    - `kodemachine start diskcheck` with shared disk attached as `/dev/vdb`
+   - `kodemachine start clawman` after stopping base
    - SSH login works
    - hostname injection works (`km-<label>`)
    - Podman hello-world works inside clone

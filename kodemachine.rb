@@ -629,6 +629,8 @@ module Kodemachine
           puts "   Consider stopping them first: kodemachine stop <label>"
         end
       else
+        ensure_base_stopped_for_clones
+
         if gui && gui_vm_running?
           abort "❌ Cannot start GUI VM: another GUI VM is already running.\n" \
                 "   Stop it first or use headless mode (without --gui)."
@@ -662,6 +664,19 @@ module Kodemachine
     end
 
     private
+
+    def ensure_base_stopped_for_clones
+      base = @config['base_image']
+      return unless @backend.vm_exists?(base)
+
+      status = @backend.vm_status(base)
+      return if status.include?('stopped')
+
+      abort "❌ Base image is #{status}. Stop it before starting clones:\n" \
+            "   kodemachine stop base\n\n" \
+            "   Clones use the base qcow2 as a backing file; running the base\n" \
+            "   at the same time can produce stale DHCP leases or disk inconsistency."
+    end
 
     def gui_vm_running?
       prefix = @config['prefix']
