@@ -27,7 +27,7 @@
    - Linux: uses virsh for VM discovery/IP/status, REXML for rename
    - Adds serial console setup (serial-getty@ttyS0 + GRUB) for Linux guests
    - Installs Podman + rootless container prerequisites in the guest (no Docker daemon)
-   - Configures MAC-independent netplan DHCP so clones with new MACs get networking
+   - Configures netplan DHCP with `dhcp-identifier: mac` so clones with new MACs get unique leases
    - Configures ssh.service override to regenerate missing SSH host keys before `sshd -t`
    - Clears SSH host keys only in the final shutdown command so subsequent SSH commands don't break
    - Uses `sudo sh -c ...` wrapping so compound sudo commands run as root

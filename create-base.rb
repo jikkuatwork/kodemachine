@@ -561,6 +561,7 @@ module KodemachineBase
               match:
                 name: "en*"
               dhcp4: true
+              dhcp-identifier: mac
               dhcp6: true
         EOF
         chmod 600 /etc/netplan/01-kodemachine.yaml
