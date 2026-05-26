@@ -603,13 +603,13 @@ module Kodemachine
       @backend = backend
     end
 
-    def ensure_running(label, gui: false, attach_disk: true, isolated: false)
+    def ensure_running(label, gui: false, attach_disk: true, isolated: false, create_if_missing: false)
       abort "❌ Label required. Run 'kodemachine' for help." unless label
 
       prefix = @config['prefix']
       label = label.sub(/^#{Regexp.escape(prefix)}/, '')
 
-      reserved = %w[list doctor delete attach status stop suspend bridge unbridge isolate]
+      reserved = %w[list doctor create delete attach status stop suspend bridge unbridge isolate]
       abort "❌ '#{label}' is a reserved command." if reserved.include?(label)
 
       is_base = label == 'base'
@@ -617,6 +617,10 @@ module Kodemachine
       vm = VM.new(name, @backend)
 
       if is_base
+        if create_if_missing
+          abort "❌ 'create base' is not valid. Use 'kodemachine start base'."
+        end
+
         puts "📦 Starting base image directly (changes will affect future clones)"
         abort "❌ Base image not found: #{name}" unless vm.exists?
 
@@ -639,6 +643,12 @@ module Kodemachine
         if vm.exists?
           puts @backend.has_shared_disk?(name) ? "📎 Has shared disk" : "💾 No shared disk attached"
         else
+          unless create_if_missing
+            abort "❌ VM '#{name}' not found.\n" \
+                  "   Start only connects to existing VMs.\n" \
+                  "   Create it first: kodemachine create #{label}"
+          end
+
           if attach_disk && shared_disk_in_use?
             puts "⚠️  Shared disk in use by another VM - spawning without it"
             attach_disk = false
@@ -723,7 +733,8 @@ module Kodemachine
       when "doctor"  then run_doctor
       when "status"  then display_status(normalize_label(args.shift))
       when "attach"  then vm_attach(normalize_label(args.shift))
-      when "start", "resume" then spawn(normalize_label(args.shift))
+      when "start", "resume" then spawn(normalize_label(args.shift), create_if_missing: false)
+      when "create"  then spawn(normalize_label(args.shift), create_if_missing: true)
       when "stop"    then vm_stop(normalize_label(args.shift))
       when "suspend" then vm_suspend(normalize_label(args.shift))
       when "delete"  then vm_delete(normalize_label(args.shift))
@@ -754,7 +765,8 @@ module Kodemachine
         Usage: kodemachine <command> [label] [options]
 
         Commands:
-          start <label>     Create/start VM and SSH into it (alias: resume)
+          start <label>     Start/resume existing VM and SSH into it (alias: resume)
+          create <label>    Create VM from base image, then SSH into it
           start base        Start the base image directly (for modifications)
           stop <label>      Shutdown VM
           suspend <label>   Pause VM to memory (fast resume)
@@ -774,7 +786,8 @@ module Kodemachine
           -h, --help        Show this help
 
         Examples:
-          kodemachine start myproject   # Create/connect to km-myproject
+          kodemachine create myproject  # Create/connect to km-myproject
+          kodemachine start myproject   # Connect to existing km-myproject
           kodemachine start base        # Modify the base image
           kodemachine suspend myproject # Pause (instant resume later)
           kodemachine stop myproject    # Shutdown km-myproject
@@ -787,8 +800,12 @@ module Kodemachine
       DEFAULT_CONFIG.merge(JSON.parse(File.read(CONFIG_FILE))) rescue DEFAULT_CONFIG.dup
     end
 
-    def spawn(label)
-      vm = @manager.ensure_running(label, gui: @options[:gui], attach_disk: !@options[:no_disk], isolated: @options[:isolated])
+    def spawn(label, create_if_missing: false)
+      vm = @manager.ensure_running(label,
+                                   gui: @options[:gui],
+                                   attach_disk: !@options[:no_disk],
+                                   isolated: @options[:isolated],
+                                   create_if_missing: create_if_missing)
 
       ip = wait_for_ip_and_ssh(vm.name)
 

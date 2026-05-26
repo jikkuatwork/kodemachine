@@ -3,9 +3,9 @@
 Ephemeral VM manager for macOS and Linux.
 
 ```bash
-kodemachine start myproject   # Create clone, boot, SSH in
+kodemachine create myproject  # Create clone, boot, SSH in
 kodemachine suspend myproject # Instant pause
-kodemachine start myproject   # Instant resume
+kodemachine start myproject   # Instant resume/reconnect
 kodemachine delete myproject  # Gone
 ```
 
@@ -63,7 +63,8 @@ directory, not your SSH keys, credentials, or other projects.
 ./create-base.rb
 
 # 3. Daily workflow
-kodemachine start myproject
+kodemachine create myproject
+kodemachine start myproject   # Later reconnects
 ```
 
 ### Linux
@@ -82,7 +83,8 @@ kodemachine start myproject
 ./create-base.rb --skip-gui --skip-browsers
 
 # 4. Daily workflow
-kodemachine start myproject
+kodemachine create myproject
+kodemachine start myproject   # Later reconnects
 ```
 
 ## Architecture
@@ -105,7 +107,7 @@ agent tooling.
 │         │            - Ubuntu + GUI + browsers            │
 │         │            - SSH key baked in                   │
 │         ▼                                                 │
-│   kodemachine.rb     Daily: Clone, start, stop, delete    │
+│   kodemachine.rb     Daily: Create, start, stop, delete   │
 │         │            macOS: UTM backend (APFS clones)    │
 │         │            Linux: libvirt backend (qcow2 CoW)  │
 │         ▼                                                 │
@@ -122,7 +124,7 @@ agent tooling.
 |------|---------|-------------|
 | `setup-host.rb` | Install dependencies (UTM or libvirt) | Once per machine |
 | `create-base.rb` | Build golden VM image | Every ~6 months |
-| `kodemachine.rb` | VM lifecycle (start/stop/clone) | Daily |
+| `kodemachine.rb` | VM lifecycle (create/start/stop/delete) | Daily |
 
 ## Setup Host
 
@@ -192,7 +194,8 @@ Run every ~6 months (or when you want a fresh golden image):
 ## Daily Commands
 
 ```
-start <label>      Create/start VM and SSH in
+create <label>     Create VM from base image and SSH in
+start <label>      Start/resume existing VM and SSH in
 start base         Start base image directly (for modifications)
 stop <label>       Graceful shutdown
 suspend <label>    Pause to memory (instant resume)
@@ -215,14 +218,14 @@ doctor             Check system health
 
 ```bash
 # Daily workflow
-kodemachine start work
+kodemachine create work
 # ... code ...
 kodemachine suspend work   # Instant pause
 kodemachine start work     # Instant resume
 
 # Multiple projects (concurrent)
-kodemachine start api
-kodemachine start frontend
+kodemachine create api
+kodemachine create frontend
 kodemachine list
 
 # Modify base image
@@ -306,9 +309,9 @@ _kodemachine() {
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W \
-      "start resume stop suspend delete status list attach doctor" \
+      "create start resume stop suspend delete status list attach doctor" \
       -- "$cur"))
-  elif [[ "$cmd" =~ ^(start|stop|suspend|delete|status|attach)$ ]]; then
+  elif [[ "$cmd" =~ ^(create|start|stop|suspend|delete|status|attach)$ ]]; then
     local labels=$(utmctl list 2>/dev/null \
       | grep 'km-' | awk '{print $3}' | sed 's/^km-//')
     COMPREPLY=($(compgen -W "base $labels" -- "$cur"))
@@ -324,8 +327,8 @@ Save to `~/.config/fish/completions/kodemachine.fish`:
 ```fish
 complete -c kodemachine -f
 complete -c kodemachine -n "__fish_use_subcommand" \
-  -a "start resume stop suspend delete status list attach doctor"
-complete -c kodemachine -n "__fish_seen_subcommand_from start stop suspend delete status attach" \
+  -a "create start resume stop suspend delete status list attach doctor"
+complete -c kodemachine -n "__fish_seen_subcommand_from create start stop suspend delete status attach" \
   -a "base (utmctl list 2>/dev/null | grep 'km-' | awk '{print \$3}' | sed 's/^km-//')"
 ```
 
