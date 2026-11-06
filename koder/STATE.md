@@ -1,4 +1,46 @@
-# State: Multi-platform support
+# State
+
+## macOS host (MacBook Air M4) — updated 2026-11-06
+
+- UTM 4.7.4 (QEMU backend), qemu-img 10.2.0 at `/opt/homebrew/bin/qemu-img`.
+- Base: `kodeimage-v0.1.0` (50 GB root). Clone in daily use: `km-hello`
+  (6 vCPU, 16 GB RAM, root 100 GB, shared Projects disk attached).
+- Shared disk: `Documents/Shared/projects-luks.qcow2`, LUKS2, now **128 GB**,
+  mounted in the guest at `/home/kodeman/Projects` (not `/mnt/projects` as
+  LUKS_DRIVE_SETUP.md says). LUKS `allow-discards` is set persistently, and a
+  guest fstrim drop-in (`/etc/systemd/system/fstrim.service.d/all-mounted.conf`)
+  makes the weekly trim cover Projects, so freed space returns to the Mac.
+- 2026-11-06 resize: Projects 64 → 128 GB, root 70 → 100 GB, and a stale UTM
+  `suspend` internal snapshot (2026-01-02, 10.6 GiB of saved RAM in
+  `efi_vars.fd`) was deleted from all images. Full log on the Mac:
+  `~/vm-resize-20261106.log`.
+- Leftover still on the Mac: `Shared/projects-luks.pre-expand-20260907T164227.qcow2`
+  (an older 10 GB copy, not linked by any VM) — owner decides.
+
+### kodemachine.rb safety fixes (2026-11-06)
+
+- `stop` used `utmctl stop`, whose default is `--force` (power cut). It now
+  uses `utmctl stop --request`, waits up to 2 minutes for `stopped`, refuses on
+  paused/suspended VMs, and never forces. Not yet exercised on a running VM.
+- `start` of an existing VM now refuses if another VM that has the shared
+  disk is not `stopped` (paused/suspended count). Before, only `create`
+  checked, and only for `started` VMs.
+- `delete` asks for the full VM name to be typed (no TTY = cancelled).
+
+### Known issues not yet fixed (from review)
+
+- `vm_exists?` matches substrings of `utmctl list` (`km-api` vs `km-api2`).
+- macOS `inject_hostname` omits `--cmd`, so it always fails silently (guest
+  hostname stays `kodemachine`); `guest_exec` reads `utmctl exec` stdout,
+  which likely returns nothing, so live RAM/CPU stats are blank.
+- `create-base.rb` `finalize_rename_macos` runs `utmctl delete` on the source
+  VM and then `mv`s its bundle — probably destroys it. Check before next rebuild.
+- `cp -Rc` result in `clone_base` is unchecked; `doctor` checks `qemu-img`
+  on PATH but the code uses a hard-coded path.
+
+---
+
+## Linux host (Ryzen) — multi-platform work
 
 ## What was done
 

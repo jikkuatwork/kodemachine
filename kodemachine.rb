@@ -81,7 +81,10 @@ module Kodemachine
     end
 
     def stop_vm(name)
-      system("utmctl", "stop", name)
+      # --request asks the guest OS to power down (like pressing the power
+      # button). utmctl's default (--force) cuts the power, which can lose
+      # unwritten data on the guest's filesystems.
+      system("utmctl", "stop", name, "--request")
     end
 
     def suspend_vm(name)
@@ -641,7 +644,19 @@ module Kodemachine
         end
 
         if vm.exists?
-          puts @backend.has_shared_disk?(name) ? "📎 Has shared disk" : "💾 No shared disk attached"
+          if @backend.has_shared_disk?(name)
+            puts "📎 Has shared disk"
+            unless vm.status.include?('started')
+              holders = shared_disk_holders(except: name)
+              unless holders.empty?
+                abort "❌ The shared disk is in use by: #{holders.map { |v| "#{v[:name]} (#{v[:status]})" }.join(', ')}\n" \
+                      "   Two VMs using it at once can corrupt it. Shut that VM down first\n" \
+                      "   (sudo shutdown -h now inside it, or: kodemachine stop <label>)."
+              end
+            end
+          else
+            puts "💾 No shared disk attached"
+          end
         else
           unless create_if_missing
             abort "❌ VM '#{name}' not found.\n" \
@@ -649,7 +664,7 @@ module Kodemachine
                   "   Create it first: kodemachine create #{label}"
           end
 
-          if attach_disk && shared_disk_in_use?
+          if attach_disk && !shared_disk_holders(except: name).empty?
             puts "⚠️  Shared disk in use by another VM - spawning without it"
             attach_disk = false
           end
@@ -695,17 +710,21 @@ module Kodemachine
         .any? { |v| @backend.has_display?(v[:name]) }
     end
 
-    def shared_disk_in_use?
+    # Other VMs that have the shared disk attached and are not fully stopped.
+    # Paused/suspended VMs count: they still hold the disk open.
+    def shared_disk_holders(except:)
       prefix = @config['prefix']
       @backend.list_vms
-        .select { |v| v[:name].include?(prefix) && v[:status] == 'started' }
-        .any? { |v| @backend.has_shared_disk?(v[:name]) }
+        .select { |v| v[:name].start_with?(prefix) && v[:name] != except && v[:status] != 'stopped' }
+        .select { |v| @backend.has_shared_disk?(v[:name]) }
     end
   end
 
   # ── CLI ────────────────────────────────────────────────────────────────────
 
   class CLI
+    STOP_WAIT_TRIES = 60 # x 2s = up to 2 minutes for a clean shutdown
+
     def self.run(args); new.execute(args); end
 
     def initialize
@@ -1101,9 +1120,31 @@ module Kodemachine
       return puts "Provide a label" unless label
       name = label == 'base' ? @config['base_image'] : "#{@config['prefix']}#{label}"
       return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
-      puts "🛑 Stopping #{name}..."
+
+      status = @backend.vm_status(name)
+      return puts "✅ #{name} is already stopped" if status.include?('stopped')
+      if status.include?('paused') || status.include?('suspended')
+        abort "❌ #{name} is #{status}. Resume it first (kodemachine start #{label}), then stop it."
+      end
+
+      puts "🛑 Asking #{name} to shut down..."
       @backend.stop_vm(name)
-      puts "✅ Stopped"
+
+      print "   Waiting"
+      STOP_WAIT_TRIES.times do
+        if @backend.vm_status(name).include?('stopped')
+          puts ""
+          puts "✅ Stopped"
+          return
+        end
+        print "."
+        $stdout.flush
+        sleep 2
+      end
+
+      puts ""
+      abort "⚠️  #{name} did not shut down within #{STOP_WAIT_TRIES * 2}s. Nothing was forced.\n" \
+            "   Shut it down from inside the VM: sudo shutdown -h now"
     end
 
     def vm_suspend(label)
@@ -1122,6 +1163,17 @@ module Kodemachine
       end
       name = "#{@config['prefix']}#{label}"
       return puts "❌ VM '#{name}' not found" unless @backend.vm_exists?(name)
+
+      puts "⚠️  This permanently deletes #{name} and its own disk (everything except the shared projects disk)."
+      print "   Type the VM name (#{name}) to confirm: "
+      $stdout.flush
+      answer = $stdin.tty? ? $stdin.gets&.strip : nil
+      unless answer == name
+        puts ""
+        puts "❌ Cancelled"
+        return
+      end
+
       puts "🗑️  Deleting #{name}..."
       @backend.delete_vm(name)
       puts "✅ Deleted"
